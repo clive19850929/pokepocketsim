@@ -1,3 +1,12 @@
+from __future__ import annotations
+
+import importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from multiprocessing.queues import Queue
+
+
 # ============================================================
 # worker.py（ai vs ai.py から分離）
 #
@@ -193,14 +202,14 @@ def play_continuous_matches_worker(num_matches: int, queue: "Queue", mcc_agg=Non
         if USE_MCC:
             try:
                 try:
-                    from pokepocketsim import reward_shaping as reward_shaping
+                    reward_shaping = importlib.import_module("pokepocketsim.reward_shaping")
                 except Exception:
-                    import reward_shaping
+                    reward_shaping = importlib.import_module("reward_shaping")
 
                 try:
-                    from pokepocketsim.my_mcc_sampler import mcc_sampler as _mcc_sampler
+                    _mcc_sampler = importlib.import_module("pokepocketsim.my_mcc_sampler").mcc_sampler
                 except Exception:
-                    from my_mcc_sampler import mcc_sampler as _mcc_sampler
+                    _mcc_sampler = importlib.import_module("my_mcc_sampler").mcc_sampler
 
                 # MCC を「回す」ために value_net が必要（ここは仮の定数モデル）
                 # ※本命はあなたの ValueNet（学習済み）をここに渡してください

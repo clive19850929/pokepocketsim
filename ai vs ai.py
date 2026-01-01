@@ -72,23 +72,31 @@ MCC（Monte-Carlo Completion）に関する現行の前提と注意
 --------------------------------------------------------------------------------
 関連ファイル（役割と関係）
 --------------------------------------------------------------------------------
-
 [ ai vs ai.py ] ・・・ オーケストレーター（本ファイル）
-  - 対戦ループ、マルチプロセス worker、集中 writer、JSONL出力、集計、デバッグログ制御
-  - worker 内で Deck を作り、Player/Match を組み立てて試合を回す
-  - build_policy() で online_mix / az_mcts / random 等を組み立て、Match に差し込む
-  - converter / encoder を Match / policy に接続し、obs_vec や候補ベクトル生成を支える
-  - MCC_CALLS（mcc_debug_snapshot 差分）を game_id 単位で表示できるようにする
+- 対戦ループ、マルチプロセス worker、集中 writer、JSONL出力、集計、デバッグログ制御
+- worker 内で Deck を作り、Player/Match を組み立てて試合を回す
+- build_policy() で online_mix / az_mcts / random 等を組み立て、Match に差し込む
+- converter / encoder を Match / policy に接続し、obs_vec や候補ベクトル生成を支える
+- MCC_CALLS（mcc_debug_snapshot 差分）を game_id 単位で表示できるようにする
 
+[ worker.py ] ・・・ ワーカープロセス本体（1プロセスで試合を回す）
+- multiprocessing の Process(target=worker.play_continuous_matches_worker, ...) から起動される
+- 1試合ぶんの raw / ids / private_ids を “batch” として queue に送る（集中 writer が統合出力）
+- Windows spawn 対応のため、子プロセス側で __main__（ai vs ai.py / __mp_main__）のグローバルを取り込み、
+  ai vs ai.py 側の設定値・ユーティリティ関数・import 済みモジュールを参照できるようにしてから worker 本体を実行する
+
+[ phaseD_q.py ] ・・・ PhaseD-Q（d3rlpy CQL）ロード/評価/π混合
+- PhaseD-Q の learnable(.d3) を lazy load し、Q(s,a) を評価して online_mix の Q 側に供給する
+- phaseD_q_load_if_needed / phaseD_q_evaluate / phaseD_mix_pi_with_q を提供し、混合（λ/温度など）を一箇所で管理する
 
 [ az_mcts_policy.py ] ・・・ AlphaZeroMCTSPolicy（MCTS(pi) 生成）
-  - Selfplay supervised PV モデル（例: selfplay_supervised_pv_gen000.pt）をロードして
-    盤面→候補→(policy,value) を出し、MCTS で π を作る中核
-  - online_mix の main_policy 側として利用される想定
+- Selfplay supervised PV モデル（例: selfplay_supervised_pv_gen000.pt）をロードして
+ 盤面→候補→(policy,value) を出し、MCTS で π を作る中核
+- online_mix の main_policy 側として利用される想定
 
 [ phased_q_mixer.py ] ・・・ （旧）PhaseD-Q 分離版（現行は未使用の可能性）
-  - 現行運用では PhaseD-Q の混合は online_mix 実装（ai vs ai.py 内の wrapper）に寄っている
-  - 将来 “PhaseD-Q を分離管理” する場合の置き場候補だが、現状は import 経路に無い可能性が高い
+- 現行運用では PhaseD-Q の混合は online_mix 実装（ai vs ai.py 内の wrapper）と phaseD_q.py 側に寄っている
+- 将来 “PhaseD-Q を完全に分離管理” する場合の置き場候補だが、現状は import 経路に無い可能性が高い
 
 [ match.py / player.py / action.py ] ・・・ シミュレータ本体（進行/合法手/行動実行）
   - Match : ターン進行・合法手列挙・勝敗決定・ログファイル出力（.log/.ml.jsonl）
