@@ -20,15 +20,36 @@ from config import (
     USE_MCTS_POLICY,
 )
 
-from phaseD_q import (
-    USE_PHASED_Q,
-    PHASED_Q_MIX_ENABLED,
-    PHASED_Q_MIX_LAMBDA,
-    PHASED_Q_MIX_TEMPERATURE,
-    phaseD_q_load_if_needed,
-    phaseD_q_evaluate,
-    phaseD_mix_pi_with_q,
-)
+try:
+    from phaseD_q import (
+        USE_PHASED_Q,
+        PHASED_Q_MIX_ENABLED,
+        PHASED_Q_MIX_LAMBDA,
+        PHASED_Q_MIX_TEMPERATURE,
+        phaseD_q_load_if_needed,
+        phaseD_q_evaluate,
+        phaseD_mix_pi_with_q,
+    )
+except Exception as _e:
+    USE_PHASED_Q = False
+    PHASED_Q_MIX_ENABLED = False
+    PHASED_Q_MIX_LAMBDA = 0.0
+    PHASED_Q_MIX_TEMPERATURE = 1.0
+
+    def phaseD_q_load_if_needed(*args, **kwargs):
+        return None
+
+    def phaseD_q_evaluate(*args, **kwargs):
+        return None
+
+    def phaseD_mix_pi_with_q(pi, *args, **kwargs):
+        return pi
+
+    try:
+        if LOG_DEBUG_DETAIL:
+            print(f"[policy_factory] phaseD_q import failed: {_e}")
+    except Exception:
+        pass
 
 from pokepocketsim.policy.random_policy import RandomPolicy
 
