@@ -431,6 +431,8 @@ PER_MATCH_LOG_DIR = None
 JSONL_ROTATE_LINES   = 0   # これを超えたら _00001.jsonl, _00002.jsonl... にローテーション（行数基準）
 IO_BUFFERING_BYTES   = 1024 * 1024  # 1MiB バッファで書き込み
 BATCH_FLUSH_INTERVAL = 100      # 100バッチごとに明示 flush（0 で無効）
+WRITER_FSYNC         = bool(int(os.getenv("WRITER_FSYNC", "0")))    # 1=flush毎にfsync（重いが安全）
+WRITER_FLUSH_SEC     = float(os.getenv("WRITER_FLUSH_SEC", "0.0"))  # 0=無効（秒）/ >0=定期flush
 
 # 並列数（用途別）: MCC用/ランダム用
 CPU_WORKERS_MCC    = 6   # MCC有効時の既定並列数
@@ -643,12 +645,8 @@ def _setup_console_tee_to_file(log_path: str, enable: bool = True) -> None:
 
     _setup_console_tee(d, prefix="ai_vs_ai_console", enable=enable, fixed_path=log_path)
 
-# --- 出力関係の保存場所 ---
-LOG_FILE = "ai_vs_ai_match.log"  # AI対戦ログ（任意）
-RAW_JSONL_PATH  = r"D:\date\ai_vs_ai_match_all.jsonl"       # 生JSONL
-IDS_JSONL_PATH  = r"D:\date\ai_vs_ai_match_all_ids.jsonl"   # ID変換済みJSONL
-PRIVATE_IDS_JSON_PATH = r"D:\date\ai_vs_ai_match_all_private_ids.jsonl"
-GAMELOG_DIR = os.path.dirname(RAW_JSONL_PATH)
+# --- 出力関係の保存場所（config.py へ分離） ---
+# LOG_FILE / RAW_JSONL_PATH / IDS_JSONL_PATH / PRIVATE_IDS_JSON_PATH / GAMELOG_DIR
 
 # --- single gamelog: save ALL console prints into one game_id.log (shared by main/worker) ---
 _RUN_GAME_ID = os.getenv("AI_VS_AI_RUN_GAME_ID", "").strip()
@@ -3334,7 +3332,23 @@ def run_random_matches_multiprocess(to_run: int):
         "pi_missing_private": 0,
     })
 
-    writer = Process(target=writer_loop, args=(q, stop), daemon=True)
+    import writer
+    writer = Process(
+        target=writer.writer_loop,
+        args=(
+            q,
+            stop,
+            RAW_JSONL_PATH,
+            IDS_JSONL_PATH,
+            PRIVATE_IDS_JSON_PATH,
+            IO_BUFFERING_BYTES,
+            JSONL_ROTATE_LINES,
+            WRITER_FSYNC,
+            WRITER_FLUSH_SEC,
+            BATCH_FLUSH_INTERVAL,
+        ),
+        daemon=True,
+    )
     writer.start()
 
     workers = []
@@ -3484,7 +3498,23 @@ def run_model_matches_multiprocess(to_run: int):
     _ensure_scaler_mask(os.path.join(model_dir, "scaler.npz"), expected_d, model_dir)
 
     # --- 共有ライタ起動 ---
-    writer = Process(target=writer_loop, args=(q, stop), daemon=True)
+    import writer
+    writer = Process(
+        target=writer.writer_loop,
+        args=(
+            q,
+            stop,
+            RAW_JSONL_PATH,
+            IDS_JSONL_PATH,
+            PRIVATE_IDS_JSON_PATH,
+            IO_BUFFERING_BYTES,
+            JSONL_ROTATE_LINES,
+            WRITER_FSYNC,
+            WRITER_FLUSH_SEC,
+            BATCH_FLUSH_INTERVAL,
+        ),
+        daemon=True,
+    )
     writer.start()
 
     # --- ワーカー起動（gpu_req_q が None なら CPU 経路で evaluate_q される） ---
