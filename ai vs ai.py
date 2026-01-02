@@ -1,238 +1,223 @@
 # jsonファイルに変換した時は[-1]など変換にミスした選択肢が無いか確認する
+
 """
 ================================================================================
-ai vs ai.py : 自己対戦ランナー（MCTS(pi) + PhaseD-Q(CQL Q) の混合）/ 学習ログ生成
+自己対戦（Self-Play）実行系 + 学習ログ生成：全体まとめ（関係整理版）
 --------------------------------------------------------------------------------
-このスクリプトは poke-pocket-sim の自己対戦を連続実行し、以下を行います。
+このプロジェクトは大きく「自己対戦を回してログを作る実行系」と、
+「ログから学習してモデルを更新する学習系」の循環で構成される。
 
-  1) 方策の構築（per-process / 遅延ロード）
-     - マルチプロセス worker 内で build_policy() を呼び、ワーカー専用の policy を生成する
-       （policy_p1 / policy_p2 が未定義でも安全に build_policy へフォールバック）
-     - online_mix の場合:
-         - main_policy : AlphaZeroMCTSPolicy（MCTS により π を生成）
-         - fallback / Q側 : PhaseD-Q（d3rlpy CQL の Q 値）を混合（OnlineMixedPolicy 等）
-       ※ PhaseD-Q の混合パラメータ（λ/温度/topk/モデルパス等）は
-          「online_mix 実装（現行: ai vs ai.py 内の policy/wrapper 群）」側で管理される
-       ※ MCTS のシミュレーション中は Player.select_action のガードにより
-          “重い online_mix を回さず deterministic で先頭を返す” 経路がある
+  (実行: Self-Play) → (ログ生成: raw / ids / private_ids) → (学習: Phase B/C/D)
+  → (生成モデル/learnable更新) → (次のSelf-Playへ反映)
 
-  2) ログの統合（1ゲーム=1ログ + 構造化ログを優先）
-     - stdout/stderr を {GAMELOG_DIR}/{game_id}.log に集約（GameLogContext）
-       ※ 既に console_tee が同一パスへ tee 済みの場合は二重 tee を回避する
-     - ML用の構造化ログは {tmp or PER_MATCH_LOG_DIR}/ai_vs_ai_match_{pid}_{n}.ml.jsonl を使用し、
-       “残骸誤読”防止のため毎試合必ず空ファイルに初期化してから書き始める
-     - 解析（parse_log_file）は可能なら常に .ml.jsonl を最優先し、
-       うまく取れない場合のみ .log へフォールバックする
+================================================================================
+1. 実行系（Self-Play）の中心：ai vs ai.py の責務
+--------------------------------------------------------------------------------
+ai vs ai.py は “統合（オーケストレーター）” であり、主に以下を担う。
 
-  3) 行動決定ログの“試合中”可視化（DECIDE pending → 行動行直前 flush）
+  1) policy 構築（per-process / worker内で遅延ロード）
+     - マルチプロセス前提のため、各 worker 内で build_policy() を呼び
+       worker専用 policy を生成する（プロセス間共有を避ける）。
+     - online_mix の概念:
+         main_policy  : AlphaZeroMCTSPolicy（モデル推論 + MCTSで π を生成）
+         Q側補助      : PhaseD-Q（d3rlpy CQL learnable による Q(s,a) 評価）
+       混合（λ/温度/topk/モデルパス等）は online_mix 実装側で管理する。
+
+     - 重要: MCTS の探索中など「重い online_mix を回すと破綻し得る局面」では、
+       Player.select_action のガードにより軽量な経路へ逃がす分岐があり得る
+       （探索内部で過剰に推論/混合を回さないための安全弁）。
+
+  2) ログ統合（1ゲーム=1単位 / 構造化ログ優先）
+     - stdout/stderr を {GAMELOG_DIR}/{game_id}.log に集約（GameLogContext）。
+     - ML用の構造化ログは .ml.jsonl を優先し、解析は
+         .ml.jsonl → 取得不能時のみ .log
+       の順でフォールバックする。
+     - “残骸誤読”防止のため .ml.jsonl は毎試合必ず空ファイルに初期化して書き始める。
+
+  3) 行動決定ログの「試合中」可視化（DECIDE pending → 行動直前flush）
      - Player.select_action 側では [DECIDE_PRE]/[DECIDE_POST]/[DECIDE_DIFF] を
-       “その場で出力せず” self._pending_decide_lines に積むだけにする
-     - Player.act_and_regather_actions の冒頭で pending を必ず flush してから
-       “行動行（例: '36 p1: ...'）” を出す
-       → 「試合中にモデルが呼ばれている」ことをログ上で定量確認できる
+       その場で出力せず pending に積む。
+     - Player.act_and_regather_actions 冒頭で pending を必ず flush してから
+       “行動行” を出す。
+       → 「試合中にモデル/混合判断が呼ばれている」をログ上で定量確認できる。
 
-  4) 終局時 SUMMARY の“1回だけ”制御
-     - 終局検知時（Player.act_and_regather_actions の game_over 分岐）に
-       match._policy_summary_logged を用いて SUMMARY を 1ゲーム1回だけ出す
-       （PhaseD-Q / online_mix の log_summary / on_game_end 等を探索して呼ぶ）
+  4) 終局 SUMMARY を “1ゲーム1回だけ” に制御
+     - 終局時に policy 側の log_summary / on_game_end 等を探索して呼ぶが、
+       match._policy_summary_logged により 1ゲーム1回に固定する。
 
-  5) 学習データ(JSONL)の生成（worker → writer のバッチ集約）
-     - raw / ids / private_ids を “batch” として queue に送る（集中 writer が統合出力）
-     - raw:
-         - LOG_FULL_INFO=True なら完全情報、False なら公開版（privates 除去）を出力
-         - end_reason（PRIZE_OUT / BASICS_OUT / DECK_OUT ...）を併記
-         - 1ゲーム1行の game_summary（record_type="game_summary"）を raw に追記する
-     - ids:
-         - 公開情報ベースの整数ID化（converter.convert_record）
-         - pi は「元ログに raw π があれば優先」、無ければ onehot 等で補完する
-         - action_candidates_vec（32d等）は _embed_legal_actions_32d で付与する
-         - obs_vec は EMIT_OBS_VEC_FOR_CANDIDATES により build_obs_partial_vec 等で付与する
-     - private_ids:
-         - keep_private=True の完全情報ID化に加え、attach_fullvec_fields により
-           obs_full_vec 等を付与する（必要な後段学習のため）
-     - デッキアウト除外:
-         - SKIP_DECKOUT_LOGGING=True の場合、デッキアウト判定を “未加工全行” で先に行い、
-           該当試合は early-continue で writer に流さない（容量/品質対策）
+  5) 学習データ(JSONL)生成（worker → writer のバッチ集約）
+     - worker は raw / ids / private_ids を batch として Queue に送る。
+     - writer が統合して 1本の JSONL を出力（flush/fsync など重い I/O を集中）。
 
+================================================================================
+2. ログ（学習データ）の種類と用途
 --------------------------------------------------------------------------------
-MCC（Monte-Carlo Completion）に関する現行の前提と注意
+Self-Play が出力する学習用ログは “役割別に3系統” に分かれる。
+
+  A) raw
+     - 人間可読寄りの構造化ログ。
+     - LOG_FULL_INFO=True なら完全情報、False なら公開版（privates 除去）。
+     - end_reason（PRIZE_OUT / BASICS_OUT / DECK_OUT ...）を併記。
+     - 1ゲーム1行の game_summary（record_type="game_summary"）を raw に追記可能。
+
+  B) ids（公開情報ベースの整数ID化）
+     - 公開情報（部分観測）を主軸に学習へ載せる主戦場。
+     - pi は “元ログに raw π があれば優先”、無ければ onehot 等で補完。
+     - action_candidates_vec（例: 32d）を legal_actions から付与可能。
+     - obs_vec（公開状態特徴量）を付与可能（obs_vector などを利用）。
+
+  C) private_ids（完全情報ベースの整数ID化）
+     - keep_private=True の完全情報ID化。
+     - obs_full_vec 等、後段学習（Phase D）に必要な “完全情報寄り特徴量” を付与可能。
+
+  例外: DECK_OUT の扱い（容量/品質対策）
+     - SKIP_DECKOUT_LOGGING=True の場合、デッキアウト判定を “未加工全行” で先に行い、
+       該当試合は early-continue で writer に流さない（学習品質と容量の両面対策）。
+
+================================================================================
+3. 主要ファイルの役割（依存方向が分かる整理）
 --------------------------------------------------------------------------------
-  - worker は match.use_mcc / match.mcc_samples / match.mcc_every / match.cpu_workers_mcc 等を設定する
-  - さらに USE_MCC or USE_REWARD_SHAPING の場合、reward_shaping_obj を Match に渡す
-  - 試合中の MCC 呼び出し回数は、mcc_debug_snapshot().total_calls の差分で計測し、
-    [MCC_CALLS] game_id=... calls=... として出力する
+[ 実行・統合（オーケストレーション） ]
+  - ai vs ai.py     : 実行入口。プロセス起動/統合/集計/デバッグ制御/最終出力方針。
+  - worker.py       : 1プロセスで試合を回す本体。Match/Player を作り play_match() を実行。
+  - writer.py       : 集中 writer。複数 worker の batch を統合して JSONL を出力。
+  - config.py       : 実行設定（フラグ/パス/パラメータ）の唯一の集約点。
 
-  - 重要（現状の不具合/要注意点）:
-      USE_MCC=True でも calls=0 になる場合がある。
-      典型原因は「MCC を呼ぶ箇所が use_reward_shaping 判定に縛られており、
-      use_mcc=True だけでは reward_shaping 側が実行されない」こと。
-      → MCC を有効化するには “Match/Player のフック条件” が
-        use_reward_shaping OR use_mcc を見るように統一されている必要がある。
+[ 方策（policy） ]
+  - policy_factory.py : build_policy() の集約。online_mix / az_mcts / random 等の組み立て。
+  - az_mcts_policy.py : AlphaZeroMCTSPolicy 本体（モデル推論→MCTS→π生成）。
+  - phaseD_q.py       : PhaseD-Q（CQL learnable）の lazy load / Q評価 / π混合。
+  - phased_q_mixer.py : 旧/分離案の置き場候補（現行未使用の可能性あり）。
 
+[ 特徴量（状態表現） ]
+  - obs_vector.py     : 公開状態→obs_vec（partial）生成。
+                        set_card_id2idx(card_id2idx) で語彙注入後に利用。
+  - policy/state_encoder.py / policy/action_encoding.py :
+                        policy内部の別経路エンコード、候補ベクトル化など。
+
+[ シミュレータ（ゲーム進行） ]
+  - match.py / player.py / action.py : 進行/合法手/行動実行/勝敗/ログ出力の核。
+  - battle_logger.py                : 通常ログ + 構造化ログ（.ml.jsonl）の土台。
+  - action_space.py                 : 行動空間定義、ID化、候補ベクトル化の基盤。
+
+[ MCC / リワードシェーピング（Phase C の核） ]
+  - my_mcc_sampler.py / mcc_ctx.py : MCC（隠れ情報補完サンプリング）実装・統計。
+  - reward_shaping.py              : PBRS（Potential Φ(s)）設計、shaped_r 付与の集約候補。
+
+================================================================================
+4. MCC（Monte-Carlo Completion）の重要注意点（運用上の落とし穴）
 --------------------------------------------------------------------------------
-関連ファイル（役割と関係）
+  - USE_MCC=True でも calls=0 になる場合がある。
+    典型原因は MCC 呼び出しフックが use_reward_shaping 判定に縛られており、
+    use_mcc=True だけでは reward_shaping 側が実行されないケース。
+
+  - Self-Play で MCC を実際に回すには、Match/Player 側のフック条件を
+        use_reward_shaping OR use_mcc
+    に統一している必要がある。
+
+  - MCC 呼び出し回数は mcc_debug_snapshot().total_calls の差分で計測し、
+    [MCC_CALLS] game_id=... calls=...
+    のように game_id 単位で確認する。
+
+================================================================================
+5. Phase B / C / D の位置づけ（ログ→学習→モデル更新）
 --------------------------------------------------------------------------------
-[ ai vs ai.py ] ・・・ オーケストレーター（本ファイル）
-- 対戦ループ、マルチプロセス worker、集中 writer、JSONL出力、集計、デバッグログ制御
-- worker 内で Deck を作り、Player/Match を組み立てて試合を回す
-- build_policy() で online_mix / az_mcts / random 等を組み立て、Match に差し込む
-- converter / encoder を Match / policy に接続し、obs_vec や候補ベクトル生成を支える
-- MCC_CALLS（mcc_debug_snapshot 差分）を game_id 単位で表示できるようにする
+  Phase B（教師あり: PV）
+    - 入力: ids ログ（公開情報ベース）
+    - 出力: PVモデル（例: selfplay_supervised_pv_gen000.pt）
+    - 目的: 盤面→(policy,value) を安定化し、MCTS の基盤にする。
 
-[ worker.py ] ・・・ ワーカープロセス本体（1プロセスで試合を回す）
-- multiprocessing の Process(target=worker.play_continuous_matches_worker, ...) から起動される
-- 1試合ぶんの raw / ids / private_ids を “batch” として queue に送る（集中 writer が統合出力）
-- Windows spawn 対応のため、子プロセス側で __main__（ai vs ai.py / __mp_main__）のグローバルを取り込み、
-  ai vs ai.py 側の設定値・ユーティリティ関数・import 済みモジュールを参照できるようにしてから worker 本体を実行する
+  Phase D（CQL: Q）
+    - 入力: private_ids ログから構築した RL dataset（npz）
+    - 出力: CQL learnable（例: learnable_phaseD_cql.d3）
+    - 目的: PhaseD-Q が online_mix の “Q側” として参照する中核。
 
-[ writer.py ] ・・・ 集中ライタープロセス（バッチ統合出力）
-- multiprocessing の Process(target=writer.writer_loop, ...) から起動される
-- 全 worker から queue で受け取った raw / ids / private_ids の JSONL 行を統合し、
-  RAW_JSONL_PATH / IDS_JSONL_PATH / PRIVATE_IDS_JSON_PATH へ安全に追記する
-- ローテーション（JSONL_ROTATE_LINES）や flush/fsync（WRITER_FLUSH_SEC/WRITER_FSYNC）等の I/O 制御を担当する
+  Phase C（橋渡し: PBRS + MCC）
+    - 目的1: DECK_OUT に流れやすい自己対戦を抑制し「勝ちに行く短期目的」を薄く混ぜる。
+    - 目的2: 部分観測でも安定して学べる表現・ラベルを作り、B と D のギャップを埋める。
+    - 目的3: 隠れ情報を覗かず MCC で “それっぽい完全情報候補” を K 個サンプルし学習を安定化。
 
-[ phaseD_q.py ] ・・・ PhaseD-Q（d3rlpy CQL）ロード/評価/π混合
-- PhaseD-Q の learnable(.d3) を lazy load し、Q(s,a) を評価して online_mix の Q 側に供給する
-- phaseD_q_load_if_needed / phaseD_q_evaluate / phaseD_mix_pi_with_q を提供し、混合（λ/温度など）を一箇所で管理する
-
-[ az_mcts_policy.py ] ・・・ AlphaZeroMCTSPolicy（MCTS(pi) 生成）
-- Selfplay supervised PV モデル（例: selfplay_supervised_pv_gen000.pt）をロードして
- 盤面→候補→(policy,value) を出し、MCTS で π を作る中核
-- online_mix の main_policy 側として利用される想定
-
-[ phased_q_mixer.py ] ・・・ （旧）PhaseD-Q 分離版（現行は未使用の可能性）
-- 現行運用では PhaseD-Q の混合は online_mix 実装（ai vs ai.py 内の wrapper）と phaseD_q.py 側に寄っている
-- 将来 “PhaseD-Q を完全に分離管理” する場合の置き場候補だが、現状は import 経路に無い可能性が高い
-
-[ match.py / player.py / action.py ] ・・・ シミュレータ本体（進行/合法手/行動実行）
-  - Match : ターン進行・合法手列挙・勝敗決定・ログファイル出力（.log/.ml.jsonl）
-            worker から use_mcc / mcc_* / converter / encoder 等を注入される
-  - Player: 行動決定（policy呼び出し）と行動実行の起点
-            - select_action: pending decide lines を積む（出力はしない）
-            - act_and_regather_actions: pending を flush して “行動行直前”に DECIDE を出す
-            - 終局時: SUMMARY を 1回だけ出す（match._policy_summary_logged）
-  - Action: 行動表現（to_id_vec 等）と変換の起点
-
-[ battle_logger.py ] ・・・ 対戦ログの記録（通常ログ + ML用の構造化ログの土台）
-  - Player から委譲されて使われる想定のロガー
-  - state/action/合法手/substeps 等を蓄積し、.ml.jsonl 出力の材料を提供
-  - 「終局後に追記しない」等のガードでログ整合性を担保する
-
-[ action_space.py ] ・・・ 行動空間の定義（ML用の ID/ベクトル化の基盤）
-  - ActionType / action schema / action_vec の次元定義など
-  - 「legal_actions の ID化」「候補ベクトル（32d等）埋め」の下支え
-
-[ cards_enum.py ] ・・・ カードID（enum）定義の中核
-[ cards_db.py ] ・・・ カードDB（カード個別定義・効果の紐付け）
-[ deck.py / decks.py ] ・・・ デッキ構築とレシピ管理（自己対戦の入力）
-[ helpers_initial_deck.py ] ・・・ 初期デッキ列/ゾーン列の enum 化ユーティリティ
-[ helpers_public_counts.py ] ・・・ 公開情報カウント（見えている枚数の推定補助）
-[ card_base.py / card.py ] ・・・ カード実体と共通基盤
-[ ability.py / supporter.py / item.py / tool.py / stadium.py ] ・・・ 効果処理の各モジュール
-[ attack.py / attack_common.py / damage_utils.py ] ・・・ ワザ処理（ダメージ/特殊処理/整合性）
-[ generator_attack.py ] ・・・ （開発補助）攻撃定義の生成器（ランタイム必須ではない場合あり）
-[ protocols.py ] ・・・ （補助）型/Protocol 定義（import 経路次第）
-
-[ my_mcc_sampler.py / mcc_ctx.py ] ・・・ MCC（Monte-Carlo Completion）一式
-  - base_state から me_private/opp_private を補完して擬似完全情報状態をサンプルする
-  - 呼び出し回数/統計のスナップショットを持ち、MCC が “実際に回っているか” を定量確認しやすい
-  - ※ 現状の自己対戦で USE_MCC=True でも calls=0 の場合は
-     「フック条件が use_reward_shaping に縛られている」疑いが強い
-
-[ reward_shaping.py ] ・・・ PBRS / 進捗特徴量 / MCCフックの集約候補
-  - Phase C 用の shaped reward / Φ(s) / 進捗特徴量（deck危険度・ターン罰など）を管理しやすい
-  - 現行の自己対戦で MCC を動かす場合は、Match/Player 側の呼び出し条件と整合が必要
-
-[ game_log.py ] ・・・ GameLogContext（stdout/stderr を game_id.log へ集約）
-  - {GAMELOG_DIR}/{game_id}.log に “試合ログ + デバッグログ” を一本化
-  - console_tee が同一パスに tee 済みなら二重teeを避ける
-
-[ console_tee.py / ai vs ai.py 内蔵tee ] ・・・ 起動直後からの tee ラッパ（任意/併用）
-  - 早い段階から stdout/stderr を tee したい場合に利用
-  - GameLogContext と併用する際は「同一パス二重書き込み」を避ける
-
---------------------------------------------------------------------------------
-学習フロー（B → D のスクリプト群）
---------------------------------------------------------------------------------
-
-[ prepare_selfplay_supervised.py ] ・・・ Phase B 教師データ JSONL 化（s_t, π_t, z）
-  - 入力: ai_vs_ai_match_all_ids.jsonl 等（ids ログ）
-  - 出力: selfplay_supervised_dataset.jsonl
-    形式: {"obs_vec","action_candidates_vec","pi","z","end_reason", ...}
-
-[ train_selfplay_supervised.py ] ・・・ Phase B 教師あり学習（Policy+Value）
-  - 入力: selfplay_supervised_dataset.jsonl
-  - 出力: selfplay_supervised_pv_gen000.pt（PVネット）
-  - end_reason で sample_weight を付与でき、DECK_OUT を弱める設計が可能
-
-[ build_phaseD_rl_dataset.py ] ・・・ Phase D 用 RL データセット(.npz) 構築
-  - 入力: ai_vs_ai_match_all_private_ids.jsonl 等（private_ids ログ）
-  - 出力: phaseD_rl_dataset_all.npz / phaseD_rl_dataset_all_meta.json
-  - end_reason による sample_weight / reward 設計をここで管理
-
-[ train_phaseD_cql.py ] ・・・ Phase D: CQL 学習（Q(s,a)）
-  - 入力: phaseD_rl_dataset_all.npz
-  - 出力: learnable_phaseD_cql.d3（d3rlpy learnable）等
-  - PhaseD-Q 側は、この learnable を読み込んで “Q推定” を行う
-
---------------------------------------------------------------------------------
-動作確認の“最低ライン”（ログでチェック）
+================================================================================
+6. 動作確認の最低ライン（ログでチェック）
 --------------------------------------------------------------------------------
   - 起動直後:
-      [POLICY_SPEC] に online_mix / SELFPLAY_ALPHAZERO_MODE / USE_MCTS_POLICY が出る
-  - 試合中（行動の直前）:
-      [DECIDE_PRE] / [DECIDE_POST] / [DECIDE_DIFF] が行動行の直前に出る
-      → 「MCTS(pi) と PhaseD-Q(Q) を使った判断が実際に呼ばれている」証拠
+      [POLICY_SPEC] に online_mix / USE_MCTS_POLICY 等が出る
+      → 実行設定と policy 構築が合っている証拠
+
+  - 試合中（行動直前）:
+      [DECIDE_PRE]/[DECIDE_POST]/[DECIDE_DIFF] が行動行の直前に出る
+      → モデル/混合判断が “実際の行動” と同期している証拠
+
   - 終局:
-      [PhaseD-Q][SUMMARY] が 1ゲーム1回だけ出る（Player の once 制御が効いている）
+      [PhaseD-Q][SUMMARY] が 1ゲーム1回だけ出る
+      → once 制御が効いている証拠
+
   - MCC:
-      [MCC_CALLS] game_id=... calls=... が出る（calls>0 が理想）
-      ※ calls=0 の場合は “MCCフック条件の誤り” を疑う（use_reward_shaping 縛り等）
+      [MCC_CALLS] ... calls>0 が理想
+      calls=0 の場合は “フック条件（use_reward_shaping縛り等）” を疑う
+
 ================================================================================
-"""
-"""
-================================================================================
-Phase C 概要（PBRS + MCC + “DECK_OUT を減らす”ための橋渡し）
+7. フロー図（Self-Play → ログ → 学習 → 次のSelf-Play）
 --------------------------------------------------------------------------------
-Phase C の狙い
-  - 目的1: DECK_OUT に流れやすい自己対戦を抑制し、「勝ちに行く短期の目的」を学習に混ぜる
-  - 目的2: 部分観測（公開情報）でも安定して学べる表現・ラベルを作る（= Phase B と Phase D の間を埋める）
-  - 目的3: 隠れ情報（山札/手札）をそのまま覗かずに、MCC で “それっぽい完全情報候補” をサンプルして学習を安定化
 
-入力（Phase C が触るログ/表現）
-  - ids ログ（公開情報ベース）:
-      obs_vec / action_candidates_vec / pi / z / end_reason ...
-  - private_ids ログ（完全情報ベース）:
-      obs_full_vec 等（必要なら）/ keep_private=True の状態
-  - deck / 初期デッキ列（helpers_initial_deck）や公開カウント（helpers_public_counts）:
-      「見えている情報」と「見えていない情報」の境界を作る材料
+  ┌───────────────────────────┐
+  │         ai vs ai.py       │
+  │ (orchestrator / launcher) │
+  └───────────────┬───────────┘
+                  │ spawn
+        ┌─────────┴─────────┐
+        │                   │
+┌───────▼────────┐  ┌───────▼────────┐
+│    worker.py   │  │    writer.py   │
+│ (play matches) │  │ (merge JSONL)  │
+└───────┬────────┘  └───────┬────────┘
+        │                    │
+        │ per match logs     │ merged outputs
+        │ (.ml.jsonl/.log)   │ (all games)
+        │                    │
+        │  batches (raw/ids/private_ids) via Queue
+        └──────────────┬───────────────────┘
+                       │
+                       ▼
+         ┌───────────────────────────┐
+         │        Output Logs        │
+         │  raw / ids / private_ids  │
+         └──────────────┬────────────┘
+                        │
+                        ▼
+     ┌───────────────────────────┐
+     │        Phase B (PV)       │
+     │ ids → supervised dataset  │
+     │ → PV model (.pt)          │
+     └──────────────┬────────────┘
+                    │ supplies PV for MCTS
+                    ▼
+     ┌───────────────────────────┐
+     │  az_mcts_policy.py (MCTS) │
+     │  PV inference → π (MCTS)  │
+     └──────────────┬────────────┘
+                    │ mixes with Q
+                    ▼
+     ┌───────────────────────────┐
+     │       Phase D (CQL)       │
+     │ private_ids → RL dataset  │
+     │ → learnable (.d3)         │
+     └──────────────┬────────────┘
+                    │ used by PhaseD-Q
+                    ▼
+     ┌───────────────────────────┐
+     │        phaseD_q.py        │
+     │   Q(s,a) eval + π mixing  │
+     └──────────────┬────────────┘
+                    │ (online_mix)
+                    └───────→ back to Self-Play
 
-中核コンポーネント
-  - MCC（my_mcc_sampler.py / mcc_ctx.py）
-      base_state（公開情報 + 一部確定情報）に対して、
-      me_private/opp_private を “候補分布”として補完し、擬似完全情報状態を複数サンプルする
-      → 1状態に対して K 個の completion を作り、期待値/分散を持った学習信号を作れる
+  [Phase C: PBRS + MCC] は Self-Play を壊さず補強する “橋渡し”。
+  - MCC: my_mcc_sampler.py / mcc_ctx.py
+  - PBRS: reward_shaping.py
+  - 注意: MCC フック条件が use_reward_shaping に縛られると calls=0 になり得るため、
+          Match/Player 側で (use_reward_shaping OR use_mcc) の統一が前提。
 
-  - PBRS / 中間報酬（reward_shaping.py）
-      Potential Φ(s) を設計し、 shaped_r = r + γΦ(s') - Φ(s) を付与する
-      - DECK_OUT を誘発する長期戦に対して、ターンペナルティ/停滞ペナルティ等を段階的に導入
-      - prize差・盤面優位・山札危険度など “勝ちに繋がる進捗” を薄く加点（やりすぎない）
-      ※ 重要: PBRS は理論上 “最適方策を保つ” 形で報酬を足せる（ただし Φ の設計は慎重に）
-
-Phase C を自己対戦に“直接”入れるときの注意（現行の落とし穴）
-  - USE_MCC=True でも、フック条件が use_reward_shaping に縛られていると MCC が呼ばれず calls=0 になる
-  - したがって、自己対戦で MCC を動かすなら
-      「reward_shaping を呼ぶ条件 = use_reward_shaping OR use_mcc」
-    が Match/Player 側で統一されている必要がある
-
-Phase C の成果物（出力）
-  - completion 平均/分散を持つ value ターゲット（任意）
-  - end_reason ベースの重み付きサンプル（DECK_OUT を弱める）
-  - Phase D（CQL）に渡す RL dataset の改善材料（reward/weight の再設計）
-
---------------------------------------------------------------------------------
-Phase C は「自己対戦を壊さずに、勝ちに行く学習信号を足す」ための調整フェーズ。
-Phase B（PV）と Phase D（CQL）をつなぐ “現場の補強工事” として位置づける。
 ================================================================================
 """
 
@@ -341,6 +326,7 @@ from config import (
     Z_PROGRESS_MAX,
 )
 from policy_factory import build_policy
+from obs_vector import build_obs_partial_vec, set_card_id2idx
 
 # -------------------------------------------------------
 # 以降の設定メモ・補助はこのファイルに残す（値そのものは config.py）
@@ -1567,6 +1553,7 @@ def _attach_action_encoder_if_supported(pol):
 _encode_action_raw, _CARD_ID2IDX, _ACTION_TYPES, (K, V, ACTION_VEC_DIM_RAW) = build_encoder_from_files(
     _card_idx_path, _action_types_path, ACTION_SCHEMAS, TYPE_SCHEMAS, MAX_ARGS
 )
+set_card_id2idx(_CARD_ID2IDX)
 
 # ログ用の候補ベクトル次元は 32 に固定（実エンコーダ出力は 32 次元にパディング／切り詰め）
 ACTION_VEC_DIM = 32
@@ -3617,725 +3604,6 @@ def build_obs_full_vec(sb_priv: dict):
     vec = _np.concatenate([me_bag, opp_bag, me_prize, opp_prize, scalars], axis=0)
     return vec.astype(_np.float32).tolist()
 
-def build_obs_partial_vec(sb_pub: dict):
-    """
-    sb_pub: state_before の公開版（me / opp のみ）を想定
-    返り値: list[float]
-
-    構成イメージ:
-      - me_hand_slots_vec        : 30スロット × Vloc（位置付き手札 one-hot）
-      - me_board_vec             : 自分アクティブ＋ベンチのポケモンID one-hot
-      - me_discard_vec           : 自分トラッシュ内カードID one-hot
-      - opp_board_vec            : 相手アクティブ＋ベンチのポケモンID one-hot
-      - opp_discard_vec          : 相手トラッシュ内カードID one-hot
-      - me_energy_vec            : 自分の場（アクティブ＋ベンチ）に付いているエネルギーカードID one-hot
-      - opp_energy_vec           : 相手の場に付いているエネルギーカードID one-hot
-      - me_active_energy_type_vec: 自分アクティブに付いているエネルギーの「種類」 one-hot（card_id ベース）
-      - opp_active_energy_type_vec: 相手アクティブに付いているエネルギーの種類 one-hot
-      - me_bench_energy_slots_vec: ベンチごとのエネルギー種類分布（max 8 スロット × Vloc）
-      - opp_bench_energy_slots_vec: 相手ベンチごとのエネルギー種類分布
-      - me_bench_board_slots_vec : ベンチごとのポケモンID分布（max 8 スロット × Vloc）
-      - opp_bench_board_slots_vec: 相手ベンチごとのポケモンID分布
-
-      - scalars                  : 11スカラー
-                                   (turn, cur_is_me, cur_is_opp,
-                                    me/opp prize, me/opp deck,
-                                    me/opp hand_count,
-                                    me/opp discard_pile_count)
-      - me_status_vec            : 自分アクティブの特殊状態 one-hot（どく/やけど/マヒ/ねむり/こんらん）
-      - opp_status_vec           : 相手アクティブの特殊状態 one-hot
-      - extra_scalars            : 18スカラー
-                                   (me/opp HP, me/opp エネ枚数, me/opp ベンチ数,
-                                    me/opp damage_counters,
-                                    me/opp has_weakness, me/opp has_resistance,
-                                    me/opp is_basic, me/opp is_ex,
-                                    me/opp retreat_cost)
-      - type_vecs                : 40 次元
-                                   (me_active_type(10), opp_active_type(10),
-                                    me_weak_type(10),  opp_weak_type(10),
-                                    me_resist_type(10),opp_resist_type(10))  ※ type -1 は all-zero
-      - ability_flags            : 4スカラー
-                                   (me ability_present/used, opp ability_present/used)
-      - tools_vec                : 2 × Vloc
-                                   (me_active_tools_vec, opp_active_tools_vec)
-      - stadium_vec              : スタジアムカードID one-hot
-                                   （top-level stadium と各 side の active_stadium を統合）
-      - turn_flags               : 8スカラー
-                                   (me: energy_attached, supporter_used, stadium_played, stadium_effect_used,
-                                    opp: 同様 4 フラグ)
-      - prev_ko_flag             : 1スカラー（前のターンで自分ポケモンが気絶したか）
-
-    ※ エネルギーやタイプは card_id/type_id ベースで区別（基本エネ／特殊エネの違いは card_id か type_id に反映されている前提）。
-    """
-    import numpy as _np
-    Vloc = len(_CARD_ID2IDX)
-    TYPE_DIM = 10  # タイプID 0〜9 を one-hot
-
-    if not isinstance(sb_pub, dict):
-        # 形が想定外なら空ベクトルを返す（上流でフィルタされる）
-        return []
-
-    me_pub  = (sb_pub.get("me")  or {})
-    opp_pub = (sb_pub.get("opp") or {})
-
-    # --- 手札 30 スロット one-hot ---
-    def _vec_from_hand_slots(hand, V: int, max_slots: int = 30):
-        v = _np.zeros(max_slots * V, dtype=_np.float32)
-        if isinstance(hand, list):
-            for i, x in enumerate(hand):
-                if i >= max_slots:
-                    break
-                try:
-                    # [card_id, n] 形式も許容
-                    cid = int(x[0] if isinstance(x, (list, tuple)) else x)
-                    idx = _CARD_ID2IDX.get(cid, None)
-                    if idx is None:
-                        continue
-                    base = i * V
-                    v[base + idx] = 1.0
-                except Exception:
-                    continue
-        return v
-
-    # --- 盤面ポケモンID（アクティブ＋ベンチ） ---
-    def _collect_pokemon_board_ids(pub: dict):
-        ids = []
-
-        active = pub.get("active_pokemon")
-        if isinstance(active, dict):
-            try:
-                cid = int(active.get("name"))
-                ids.append(cid)
-            except Exception:
-                pass
-
-        bench = pub.get("bench_pokemon")
-        if isinstance(bench, list):
-            for obj in bench:
-                if isinstance(obj, dict):
-                    try:
-                        cid = int(obj.get("name"))
-                        ids.append(cid)
-                    except Exception:
-                        continue
-
-        return _vec_from_id_list(ids, Vloc)
-
-    # --- ベンチごとのポケモンID分布（max_bench_slots × Vloc） ---
-    def _build_bench_board_slots_vec(pub: dict, V: int, max_bench_slots: int = 8):
-        v = _np.zeros(max_bench_slots * V, dtype=_np.float32)
-        bench = pub.get("bench_pokemon")
-        if not isinstance(bench, list):
-            return v
-        for i, obj in enumerate(bench):
-            if i >= max_bench_slots:
-                break
-            if not isinstance(obj, dict):
-                continue
-            try:
-                cid = int(obj.get("name"))
-                idx = _CARD_ID2IDX.get(cid, None)
-                if idx is None:
-                    continue
-                base = i * V
-                v[base + idx] = 1.0
-            except Exception:
-                continue
-        return v
-
-    # --- 単一ポケモンからエネルギーカード ID を集める ---
-    def _collect_energy_ids_from_poke(poke: dict):
-        ids = []
-        if not isinstance(poke, dict):
-            return ids
-        # 可能性のあるキーを全部見る
-        for key in ("energies", "energy", "attached_energies", "attached_energy", "energy_cards"):
-            lst = poke.get(key)
-            if isinstance(lst, list):
-                for x in lst:
-                    try:
-                        cid = int(x[0] if isinstance(x, (list, tuple)) else x)
-                        ids.append(cid)
-                    except Exception:
-                        continue
-        return ids
-
-    # --- 場に付いているエネルギーカードID（アクティブ＋ベンチ合算） ---
-    def _collect_attached_energy_ids(pub: dict):
-        ids = []
-
-        active = pub.get("active_pokemon")
-        if isinstance(active, dict):
-            ids.extend(_collect_energy_ids_from_poke(active))
-
-        bench = pub.get("bench_pokemon")
-        if isinstance(bench, list):
-            for obj in bench:
-                if isinstance(obj, dict):
-                    ids.extend(_collect_energy_ids_from_poke(obj))
-
-        return _vec_from_id_list(ids, Vloc)
-
-    # --- アクティブポケモンの HP / 特殊状態 / エネ枚数 ---
-    def _extract_active_features(pub: dict):
-        """
-        戻り値:
-          hp: float
-          status_vec: 長さ5（poison/burn/paralysis/sleep/confusion）
-          energy_count: float
-        """
-        hp = 0.0
-        status_vec = _np.zeros(5, dtype=_np.float32)
-        energy_count = 0.0
-
-        active = pub.get("active_pokemon")
-        if isinstance(active, dict):
-            # HP（remaining_hp / hp / current_hp のどれかがあれば使う）
-            for key in ("remaining_hp", "hp", "current_hp"):
-                if key in active:
-                    try:
-                        hp = float(active.get(key) or 0.0)
-                        break
-                    except Exception:
-                        pass
-
-            # 特殊状態
-            raw_cond = active.get("special_conditions") or active.get("conditions") or []
-            cond_list = []
-            if isinstance(raw_cond, list):
-                cond_list = raw_cond
-            elif isinstance(raw_cond, str):
-                cond_list = [raw_cond]
-
-            def _norm(s):
-                if not isinstance(s, str):
-                    return ""
-                return s.strip().lower()
-
-            for c in cond_list:
-                k = _norm(c)
-                if k in ("poison", "poisoned", "どく"):
-                    status_vec[0] = 1.0
-                elif k in ("burn", "burned", "やけど"):
-                    status_vec[1] = 1.0
-                elif k in ("paralyze", "paralyzed", "paralysis", "マヒ", "まひ"):
-                    status_vec[2] = 1.0
-                elif k in ("sleep", "asleep", "ねむり"):
-                    status_vec[3] = 1.0
-                elif k in ("confuse", "confused", "こんらん"):
-                    status_vec[4] = 1.0
-
-            # 付いているエネ枚数
-            for key in ("energies", "energy", "attached_energies", "attached_energy", "energy_cards"):
-                lst = active.get(key)
-                if isinstance(lst, list):
-                    energy_count += float(len(lst))
-
-        return hp, status_vec, energy_count
-
-    # --- アクティブの追加メタ情報 ---
-    def _extract_active_meta(pub: dict):
-        """
-        戻り値 dict:
-          damage_counters: float
-          type_id: int
-          has_weakness: float
-          weakness_type: int
-          has_resistance: float
-          resistance_type: int
-          is_basic: float
-          is_ex: float
-          retreat_cost: float
-          ability_present: float
-          ability_used: float
-          tools_ids: List[int]
-        """
-        active = pub.get("active_pokemon")
-        info = {
-            "damage_counters": 0.0,
-            "type_id": -1,
-            "has_weakness": 0.0,
-            "weakness_type": -1,
-            "has_resistance": 0.0,
-            "resistance_type": -1,
-            "is_basic": 0.0,
-            "is_ex": 0.0,
-            "retreat_cost": 0.0,
-            "ability_present": 0.0,
-            "ability_used": 0.0,
-            "tools_ids": [],
-        }
-        if not isinstance(active, dict):
-            return info
-
-        try:
-            info["damage_counters"] = float(active.get("damage_counters") or 0.0)
-        except Exception:
-            pass
-
-        try:
-            t = active.get("type")
-            if t is not None:
-                info["type_id"] = int(t)
-        except Exception:
-            pass
-
-        def _as_bool(x):
-            if isinstance(x, bool):
-                return 1.0 if x else 0.0
-            if isinstance(x, (int, float)):
-                return 1.0 if x != 0 else 0.0
-            if isinstance(x, str):
-                v = x.strip().lower()
-                if v in ("1", "true", "yes", "y", "on"):
-                    return 1.0
-                if v in ("0", "false", "no", "n", "off", ""):
-                    return 0.0
-            return 0.0
-
-        info["has_weakness"] = _as_bool(active.get("has_weakness"))
-        info["has_resistance"] = _as_bool(active.get("has_resistance"))
-        info["is_basic"] = _as_bool(active.get("is_basic"))
-        info["is_ex"] = _as_bool(active.get("is_ex"))
-
-        try:
-            wt = active.get("weakness_type")
-            if wt is not None:
-                info["weakness_type"] = int(wt)
-        except Exception:
-            pass
-        try:
-            rt = active.get("resistance_type")
-            if rt is not None:
-                info["resistance_type"] = int(rt)
-        except Exception:
-            pass
-
-        try:
-            rc = active.get("retreat_cost")
-            if rc is not None:
-                info["retreat_cost"] = float(rc)
-        except Exception:
-            pass
-
-        info["ability_present"] = _as_bool(
-            active.get("ability_present") if "ability_present" in active else active.get("has_ability")
-        )
-        info["ability_used"] = _as_bool(
-            active.get("ability_used") if "ability_used" in active else active.get("ability_used_this_turn")
-        )
-
-        tools_ids = []
-        for key in ("tools", "tool", "attached_tools", "pokemon_tools"):
-            lst = active.get(key)
-            if isinstance(lst, list):
-                for x in lst:
-                    try:
-                        cid = int(x[0] if isinstance(x, (list, tuple)) else x)
-                        tools_ids.append(cid)
-                    except Exception:
-                        continue
-            elif lst is not None:
-                try:
-                    cid = int(lst)
-                    tools_ids.append(cid)
-                except Exception:
-                    pass
-        info["tools_ids"] = tools_ids
-
-        return info
-
-    # --- タイプIDを one-hot に変換 ---
-    def _type_id_to_onehot(type_id: int, dim: int = TYPE_DIM):
-        v = _np.zeros(dim, dtype=_np.float32)
-        try:
-            t = int(type_id)
-            if 0 <= t < dim:
-                v[t] = 1.0
-        except Exception:
-            pass
-        return v
-
-    # --- アクティブに付いているエネルギーの「種類」 one-hot ---
-    def _collect_active_energy_type_vec(pub: dict, V: int):
-        active = pub.get("active_pokemon")
-        ids = _collect_energy_ids_from_poke(active) if isinstance(active, dict) else []
-        return _vec_from_id_list(ids, V)
-
-    # --- ベンチごとのエネルギー種類分布（max_bench_slots × Vloc） ---
-    def _build_bench_energy_slots_vec(pub: dict, V: int, max_bench_slots: int = 8):
-        v = _np.zeros(max_bench_slots * V, dtype=_np.float32)
-        bench = pub.get("bench_pokemon")
-        if not isinstance(bench, list):
-            return v
-        for i, obj in enumerate(bench):
-            if i >= max_bench_slots:
-                break
-            if not isinstance(obj, dict):
-                continue
-            ids = _collect_energy_ids_from_poke(obj)
-            if not ids:
-                continue
-            slot_vec = _vec_from_id_list(ids, V)
-            base = i * V
-            v[base:base + V] = slot_vec
-        return v
-
-    # --- 「ターン内 1回」系のフラグを抽出 ---
-    def _extract_turn_flags_for_side(pub_side: dict, sb: dict, side_key: str):
-        """
-        返り値: np.array(4,)
-          [energy_attached, supporter_used, stadium_played, stadium_effect_used]
-        それぞれ 0.0/1.0。キーが存在しない場合は 0.0。
-        """
-        flags = {
-            "energy_attached": 0.0,
-            "supporter_used": 0.0,
-            "stadium_played": 0.0,
-            "stadium_effect_used": 0.0,
-        }
-
-        # サイド側にぶら下がっているフラグ候補
-        cand_maps = [
-            pub_side,
-            sb.get("turn_flags") or {},
-            sb.get("meta") or {},
-        ]
-
-        def _as_bool(x):
-            if isinstance(x, bool):
-                return 1.0 if x else 0.0
-            if isinstance(x, (int, float)):
-                return 1.0 if x != 0 else 0.0
-            if isinstance(x, str):
-                v = x.strip().lower()
-                if v in ("1", "true", "yes", "y", "on"):
-                    return 1.0
-                if v in ("0", "false", "no", "n", "off", ""):
-                    return 0.0
-            return 0.0
-
-        # キーの候補を広めにとる（実際に存在するものだけ効く）
-        key_candidates = {
-            "energy_attached": [
-                "energy_attached_this_turn",
-                "energy_attach_this_turn",
-                "energy_attached",
-                "has_attached_energy_this_turn",
-            ],
-            "supporter_used": [
-                "supporter_used_this_turn",
-                "supporter_played_this_turn",
-                "supporter_used",
-            ],
-            "stadium_played": [
-                "stadium_played_this_turn",
-                "stadium_used_this_turn",
-                "stadium_played",
-            ],
-            "stadium_effect_used": [
-                "stadium_effect_used_this_turn",
-                "stadium_effect_used",
-                "stadium_effect_this_turn",
-            ],
-        }
-
-        for name, keys in key_candidates.items():
-            for d in cand_maps:
-                if not isinstance(d, dict):
-                    continue
-                for k in keys:
-                    if k in d:
-                        flags[name] = max(flags[name], _as_bool(d.get(k)))
-                # side_key 付きのネームスペースも一応見る
-                side_map = d.get(side_key) if isinstance(d.get(side_key), dict) else None
-                if isinstance(side_map, dict):
-                    for k in keys:
-                        if k in side_map:
-                            flags[name] = max(flags[name], _as_bool(side_map.get(k)))
-
-        return _np.array(
-            [
-                flags["energy_attached"],
-                flags["supporter_used"],
-                flags["stadium_played"],
-                flags["stadium_effect_used"],
-            ],
-            dtype=_np.float32,
-        )
-
-    # --- 前のターンに自分ポケモンが気絶したかフラグ ---
-    def _extract_prev_ko_flag(sb: dict, pub_side: dict, side_key: str):
-        """
-        返り値: float（0.0 or 1.0）
-        候補キー:
-          - sb["prev_knockout"][side_key]
-          - sb["last_turn_knockout"][side_key]
-          - pub_side["ko_last_turn"], pub_side["knocked_out_last_turn"] など
-        """
-        def _as_bool(x):
-            if isinstance(x, bool):
-                return 1.0 if x else 0.0
-            if isinstance(x, (int, float)):
-                return 1.0 if x != 0 else 0.0
-            if isinstance(x, str):
-                v = x.strip().lower()
-                if v in ("1", "true", "yes", "y", "on"):
-                    return 1.0
-                if v in ("0", "false", "no", "n", "off", ""):
-                    return 0.0
-            return 0.0
-
-        # state_before 直下に side ごとの情報があるケース
-        for key in ("prev_knockout", "last_turn_knockout", "previous_turn_knockout"):
-            d = sb.get(key)
-            if isinstance(d, dict) and side_key in d:
-                return _as_bool(d.get(side_key))
-
-        # サイド側に直接ぶら下がっているケース
-        for key in ("ko_last_turn", "knocked_out_last_turn", "pokemon_fainted_last_turn"):
-            if key in pub_side:
-                return _as_bool(pub_side.get(key))
-
-        return 0.0
-
-    # --- 基本ベクトル ---
-    me_hand_slots_vec = _vec_from_hand_slots(me_pub.get("hand", []), Vloc)
-    me_board_vec      = _collect_pokemon_board_ids(me_pub)
-    me_discard_vec    = _vec_from_id_list(me_pub.get("discard_pile", []), Vloc)
-
-    opp_board_vec     = _collect_pokemon_board_ids(opp_pub)
-    opp_discard_vec   = _vec_from_id_list(opp_pub.get("discard_pile", []), Vloc)
-
-    me_energy_vec     = _collect_attached_energy_ids(me_pub)
-    opp_energy_vec    = _collect_attached_energy_ids(opp_pub)
-
-    # --- アクティブのエネルギー「種類」ベクトル ---
-    me_active_energy_type_vec  = _collect_active_energy_type_vec(me_pub, Vloc)
-    opp_active_energy_type_vec = _collect_active_energy_type_vec(opp_pub, Vloc)
-
-    # --- ベンチごとのエネルギー種類分布 ---
-    me_bench_energy_slots_vec  = _build_bench_energy_slots_vec(me_pub, Vloc)
-    opp_bench_energy_slots_vec = _build_bench_energy_slots_vec(opp_pub, Vloc)
-
-    # --- ベンチごとのポケモンID分布 ---
-    me_bench_board_slots_vec  = _build_bench_board_slots_vec(me_pub, Vloc)
-    opp_bench_board_slots_vec = _build_bench_board_slots_vec(opp_pub, Vloc)
-
-    # --- ターン情報・サイド・山札残数＋手札枚数＋トラッシュ枚数 ---
-    turn = int(sb_pub.get("turn") or 0)
-    cur  = sb_pub.get("current_player")
-
-    me_player  = me_pub.get("player")
-    opp_player = opp_pub.get("player")
-
-    cur_onehot = _np.array(
-        [
-            1.0 if cur == me_player else 0.0,
-            1.0 if cur == opp_player else 0.0,
-        ],
-        dtype=_np.float32,
-    )
-
-    me_prize_cnt  = int(me_pub.get("prize_count") or 0)
-    opp_prize_cnt = int(opp_pub.get("prize_count") or 0)
-    me_deck_cnt   = int(me_pub.get("deck_count")  or 0)
-    opp_deck_cnt  = int(opp_pub.get("deck_count") or 0)
-
-    me_hand_cnt   = int(me_pub.get("hand_count") or (len(me_pub.get("hand")) if isinstance(me_pub.get("hand"), list) else 0))
-    opp_hand_cnt  = int(opp_pub.get("hand_count") or (len(opp_pub.get("hand")) if isinstance(opp_pub.get("hand"), list) else 0))
-
-    me_discard_cnt  = int(me_pub.get("discard_pile_count") or (len(me_pub.get("discard_pile")) if isinstance(me_pub.get("discard_pile"), list) else 0))
-    opp_discard_cnt = int(opp_pub.get("discard_pile_count") or (len(opp_pub.get("discard_pile")) if isinstance(opp_pub.get("discard_pile"), list) else 0))
-
-    scalars = _np.array(
-        [
-            turn,
-            cur_onehot[0],
-            cur_onehot[1],
-            me_prize_cnt,
-            opp_prize_cnt,
-            me_deck_cnt,
-            opp_deck_cnt,
-            me_hand_cnt,
-            opp_hand_cnt,
-            me_discard_cnt,
-            opp_discard_cnt,
-        ],
-        dtype=_np.float32,
-    )
-
-    # --- アクティブ状態／エネ枚数／ベンチ数 ---
-    me_hp,  me_status_vec,  me_energy_cnt  = _extract_active_features(me_pub)
-    opp_hp, opp_status_vec, opp_energy_cnt = _extract_active_features(opp_pub)
-
-    me_bench = me_pub.get("bench_pokemon")
-    opp_bench = opp_pub.get("bench_pokemon")
-
-    def _count_real_bench(lst):
-        """
-        bench_pokemon は [dict or 0 or None, ...] のようにスロット数で埋められることがあるため、
-        実際にポケモンが存在するスロット（dict）のみを数える。
-        スタジアム効果により 3〜8 スロットになる変動もこのカウントで吸収する。
-        """
-        if not isinstance(lst, list):
-            return 0.0
-        c = 0
-        for obj in lst:
-            if isinstance(obj, dict):
-                c += 1
-        return float(c)
-
-    me_bench_cnt  = _count_real_bench(me_bench)
-    opp_bench_cnt = _count_real_bench(opp_bench)
-
-    # --- アクティブの追加メタ情報 ---
-    me_meta  = _extract_active_meta(me_pub)
-    opp_meta = _extract_active_meta(opp_pub)
-
-    extra_scalars = _np.array(
-        [
-            me_hp,
-            opp_hp,
-            me_energy_cnt,
-            opp_energy_cnt,
-            me_bench_cnt,
-            opp_bench_cnt,
-            me_meta["damage_counters"],
-            opp_meta["damage_counters"],
-            me_meta["has_weakness"],
-            opp_meta["has_weakness"],
-            me_meta["has_resistance"],
-            opp_meta["has_resistance"],
-            me_meta["is_basic"],
-            opp_meta["is_basic"],
-            me_meta["is_ex"],
-            opp_meta["is_ex"],
-            me_meta["retreat_cost"],
-            opp_meta["retreat_cost"],
-        ],
-        dtype=_np.float32,
-    )
-
-    # --- タイプ関連 one-hot ---
-    me_type_vec        = _type_id_to_onehot(me_meta["type_id"], TYPE_DIM)
-    opp_type_vec       = _type_id_to_onehot(opp_meta["type_id"], TYPE_DIM)
-    me_weak_type_vec   = _type_id_to_onehot(me_meta["weakness_type"], TYPE_DIM)
-    opp_weak_type_vec  = _type_id_to_onehot(opp_meta["weakness_type"], TYPE_DIM)
-    me_resist_type_vec = _type_id_to_onehot(me_meta["resistance_type"], TYPE_DIM)
-    opp_resist_type_vec= _type_id_to_onehot(opp_meta["resistance_type"], TYPE_DIM)
-
-    type_vecs = _np.concatenate(
-        [
-            me_type_vec,
-            opp_type_vec,
-            me_weak_type_vec,
-            opp_weak_type_vec,
-            me_resist_type_vec,
-            opp_resist_type_vec,
-        ],
-        axis=0,
-    )
-
-    # --- アビリティフラグ ---
-    ability_flags = _np.array(
-        [
-            me_meta["ability_present"],
-            me_meta["ability_used"],
-            opp_meta["ability_present"],
-            opp_meta["ability_used"],
-        ],
-        dtype=_np.float32,
-    )
-
-    # --- アクティブポケモンに付いているどうぐ ---
-    me_tools_vec  = _vec_from_id_list(me_meta["tools_ids"], Vloc)
-    opp_tools_vec = _vec_from_id_list(opp_meta["tools_ids"], Vloc)
-
-    # --- スタジアムカード ---
-    stadium_ids = []
-    stadium = sb_pub.get("stadium")
-    if isinstance(stadium, dict):
-        # {"name": id} / {"id": id} の両方を許容
-        if "name" in stadium:
-            try:
-                stadium_ids.append(int(stadium.get("name")))
-            except Exception:
-                pass
-        if "id" in stadium:
-            try:
-                stadium_ids.append(int(stadium.get("id")))
-            except Exception:
-                pass
-    elif stadium is not None:
-        try:
-            stadium_ids.append(int(stadium))
-        except Exception:
-            pass
-
-    # サイド別 active_stadium も拾う
-    for side_pub in (me_pub, opp_pub):
-        st = side_pub.get("active_stadium")
-        if isinstance(st, dict):
-            if "name" in st:
-                try:
-                    stadium_ids.append(int(st.get("name")))
-                except Exception:
-                    pass
-            if "id" in st:
-                try:
-                    stadium_ids.append(int(st.get("id")))
-                except Exception:
-                    pass
-        elif st is not None:
-            try:
-                stadium_ids.append(int(st))
-            except Exception:
-                pass
-
-    stadium_vec = _vec_from_id_list(stadium_ids, Vloc)
-
-    # --- ターン内 1回系フラグ（自分・相手） ---
-    me_turn_flags  = _extract_turn_flags_for_side(me_pub, sb_pub, "me")
-    opp_turn_flags = _extract_turn_flags_for_side(opp_pub, sb_pub, "opp")
-    turn_flags = _np.concatenate([me_turn_flags, opp_turn_flags], axis=0)
-
-    # --- 前のターンで自分ポケモンが気絶したか ---
-    prev_ko_flag = _np.array(
-        [_extract_prev_ko_flag(sb_pub, me_pub, "me")],
-        dtype=_np.float32,
-    )
-
-    vec = _np.concatenate(
-        [
-            me_hand_slots_vec,
-            me_board_vec,
-            me_discard_vec,
-            opp_board_vec,
-            opp_discard_vec,
-            me_energy_vec,
-            opp_energy_vec,
-            me_active_energy_type_vec,
-            opp_active_energy_type_vec,
-            me_bench_energy_slots_vec,
-            opp_bench_energy_slots_vec,
-            me_bench_board_slots_vec,
-            opp_bench_board_slots_vec,
-            scalars,
-            me_status_vec,
-            opp_status_vec,
-            extra_scalars,
-            type_vecs,
-            ability_flags,
-            me_tools_vec,
-            opp_tools_vec,
-            stadium_vec,
-            turn_flags,
-            prev_ko_flag,
-        ],
-        axis=0,
-    )
-    return vec.astype(_np.float32).tolist()
 
 def attach_fullvec_fields(id_entry_priv: dict):
     """
