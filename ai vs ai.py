@@ -78,10 +78,10 @@ Self-Play が出力する学習用ログは “役割別に3系統” に分か�
 3. 主要ファイルの役割（依存方向が分かる整理）
 --------------------------------------------------------------------------------
 [ 実行・統合（オーケストレーション） ]
-  - ai vs ai.py     : 実行入口。プロセス起動/統合/集計/デバッグ制御/最終出力方針。
-  - worker.py       : 1プロセスで試合を回す本体。Match/Player を作り play_match() を実行。
-  - writer.py       : 集中 writer。複数 worker の batch を統合して JSONL を出力。
-  - config.py       : 実行設定（フラグ/パス/パラメータ）の唯一の集約点。
+  - ai vs ai.py       : 実行入口。プロセス起動/統合/集計/デバッグ制御/最終出力方針。
+  - worker.py         : 1プロセスで試合を回す本体。Match/Player を作り play_match() を実行。
+  - writer.py         : 集中 writer。複数 worker の batch を統合して JSONL を出力。
+  - config.py         : 実行設定（フラグ/パス/パラメータ）の唯一の集約点。
 
 [ 方策（policy） ]
   - policy_factory.py : build_policy() の集約。online_mix / az_mcts / random 等の組み立て。
@@ -92,6 +92,8 @@ Self-Play が出力する学習用ログは “役割別に3系統” に分か�
 [ 特徴量（状態表現） ]
   - obs_vector.py     : 公開状態→obs_vec（partial）生成。
                         set_card_id2idx(card_id2idx) で語彙注入後に利用。
+  - legal_actions.py  : legal_actions の抽出・整形、候補ベクトル化（action_candidates_vec 等）。
+                        ai vs ai.py から import して __main__ に再公開（worker が参照する設計のため）。
   - policy/state_encoder.py / policy/action_encoding.py :
                         policy内部の別経路エンコード、候補ベクトル化など。
 
@@ -327,6 +329,14 @@ from config import (
 )
 from policy_factory import build_policy
 from obs_vector import build_obs_partial_vec, set_card_id2idx
+from legal_actions import (
+    set_action_encoder as _set_action_encoder,
+    _safe_encode_obs_for_candidates,
+    _embed_legal_actions_32d,
+    encode_action_from_vec_32d,
+    _attach_action_encoder_if_supported,
+    _pick_legal_actions,
+)
 
 # -------------------------------------------------------
 # 以降の設定メモ・補助はこのファイルに残す（値そのものは config.py）
@@ -858,108 +868,7 @@ EMIT_OBS_VEC_FOR_CANDIDATES = True      # True なら obs_vec も各レコード
 # 追加: 空の legal_actions はキーごと出さない
 DROP_EMPTY_LEGAL_ACTIONS = True
 
-def _safe_encode_obs_for_candidates(sb_src, encoder, la_ids=None):
-    """obs_vec を『必ず』生成し、0次元だった場合はその場で警告を出す。"""
-    try:
-        me  = sb_src.get("me",  {}) if isinstance(sb_src, dict) else {}
-        opp = sb_src.get("opp", {}) if isinstance(sb_src, dict) else {}
-        feat = {"me": me, "opp": opp}
-        if isinstance(la_ids, list) and la_ids:
-            feat["legal_actions"] = la_ids
 
-        out = encoder.encode_state(feat)
-        try:
-            import numpy as _np
-            arr = _np.asarray(out, dtype=_np.float32).reshape(-1)
-            if arr.size == 0:
-                print("[OBS] ⚠️ encoder から 0次元ベクトルが返りました（scaler不在/不一致の可能性）")
-            return arr.tolist()
-        except Exception:
-            if isinstance(out, list) and len(out) == 0:
-                print("[OBS] ⚠️ obs_vec が [] です（encoder を確認してください）")
-            return out if isinstance(out, list) else []
-    except Exception as e:
-        print(f"[OBS] encode_state failed (with legal_actions): {e}")
-        # legal_actions 無しで再トライ
-        try:
-            out = encoder.encode_state({"me": me, "opp": opp})
-            try:
-                import numpy as _np
-                arr = _np.asarray(out, dtype=_np.float32).reshape(-1)
-                if arr.size == 0:
-                    print("[OBS] ⚠️ encoder から 0次元ベクトルが返りました（fallback, no legal_actions）")
-                return arr.tolist()
-            except Exception:
-                return out if isinstance(out, list) else []
-        except Exception:
-            return []
-
-def _embed_legal_actions_32d(la_ids):  # pyright: ignore[reportUnusedFunction]
-    outs = []
-    try:
-        import numpy as np
-    except Exception:
-        return []
-
-    TARGET_DIM = 32
-
-    def _zeros():
-        return [0.0] * TARGET_DIM
-
-    def _to_id_vec(a):
-        if isinstance(a, list) and len(a) > 0:
-            return a
-        if isinstance(a, tuple) and len(a) > 0:
-            return list(a)
-        if isinstance(a, int):
-            return [a]
-        if isinstance(a, dict):
-            v = a.get("id")
-            if isinstance(v, int):
-                return [v]
-            return None
-        return None
-
-    src = (la_ids or [])
-    for a in src:
-        a_vec = _to_id_vec(a)
-        if not isinstance(a_vec, list) or not a_vec:
-            outs.append(_zeros())
-            continue
-
-        try:
-            v = encode_action_from_vec_32d(a_vec)
-            arr = np.asarray(v, dtype=np.float32).reshape(-1)
-        except Exception:
-            outs.append(_zeros())
-            continue
-
-        if arr.size < TARGET_DIM:
-            pad = np.zeros(TARGET_DIM - arr.size, dtype=np.float32)
-            arr = np.concatenate([arr, pad], axis=0)
-        elif arr.size > TARGET_DIM:
-            arr = arr[:TARGET_DIM]
-
-        # “全 -1” は無効候補として 0 に落とす（全滅はさせない）
-        try:
-            if arr.size == TARGET_DIM and bool(np.all(np.isfinite(arr))) and bool(np.all(np.abs(arr + 1.0) <= 1e-9)):
-                outs.append(_zeros())
-                continue
-        except Exception:
-            pass
-
-        # NaN/Inf も 0 に落とす
-        try:
-            if not bool(np.all(np.isfinite(arr))):
-                outs.append(_zeros())
-                continue
-        except Exception:
-            outs.append(_zeros())
-            continue
-
-        outs.append(arr.astype(np.float32).tolist())
-
-    return outs
 
 def _pad_action_vecs_to_dim(vecs, target_dim):
     """Policy/model 入力用に action vec を target_dim へ 0 パディング/切詰めする。"""
@@ -1499,54 +1408,7 @@ def _wrap_select_action_for_mcts_counter(pol, tag):
     except Exception:
         return pol
 
-def encode_action_from_vec_32d(five_ints):
-    try:
-        v = _encode_action_raw(five_ints)
 
-        # _encode_action_raw の生出力（例: 17d）を Policy 期待次元（例: 32d）へ揃える
-        if isinstance(v, np.ndarray):
-            vv = v.reshape(-1).tolist()
-        elif isinstance(v, (list, tuple)):
-            vv = list(v)
-        else:
-            vv = [v]
-
-        try:
-            target_dim = int(globals().get("ACTION_VEC_DIM", 0) or 0)
-        except Exception:
-            target_dim = 0
-
-        if target_dim > 0:
-            if len(vv) < target_dim:
-                vv = vv + [0] * (target_dim - len(vv))
-            elif len(vv) > target_dim:
-                vv = vv[:target_dim]
-
-        return vv
-    except NameError:
-        raise RuntimeError(
-            "Action encoder is not initialized yet. "
-            "Call build_encoder_from_files(...) before using encode_action_from_vec_32d."
-        )
-
-def _attach_action_encoder_if_supported(pol):
-    """
-    モデル方策や GPU クライアント側にアクション埋め込み関数を渡せるフックが
-    用意されている場合に差し込む（後方互換のためのベストエフォート）。
-    """
-    try:
-        enc32 = globals().get("encode_action_from_vec_32d", None)
-        enc19 = globals().get("encode_action_from_vec_19d", None)
-        enc = enc32 if callable(enc32) else (enc19 if callable(enc19) else None)
-        if enc is None:
-            return
-
-        if hasattr(pol, "set_action_encoder") and callable(getattr(pol, "set_action_encoder")):
-            pol.set_action_encoder(enc)
-        elif hasattr(pol, "action_encoder_fn"):
-            pol.action_encoder_fn = enc
-    except Exception:
-        pass
 
 
 # 共有エンコーダ関数を生成（唯一の正解）
@@ -1557,6 +1419,9 @@ set_card_id2idx(_CARD_ID2IDX)
 
 # ログ用の候補ベクトル次元は 32 に固定（実エンコーダ出力は 32 次元にパディング／切り詰め）
 ACTION_VEC_DIM = 32
+
+# legal_actions 側へアクションエンコーダを注入（候補ベクトル生成で使用）
+_set_action_encoder(_encode_action_raw, ACTION_VEC_DIM)
 
 if LOG_DEBUG_DETAIL:
     print("\n[SYNC] ===== Policy boot spec =====")
@@ -2494,60 +2359,6 @@ def _is_decision_entry(e: dict) -> bool:
 
 
 # ▼ これをヘルパー関数群の近く（CardNameToIdConverter の上/下どちらでもOK）に追加
-def _pick_legal_actions(entry: dict):
-    """
-    候補手を取り出す優先順:
-      1) top-level entry['legal_actions']
-      2) action_result['legal_actions']
-      3) action_result.substeps[*].legal_actions（後ろから）
-      4) state_before / state_after の top-level 'legal_actions'
-      5) state_before/after の me / opp の 'legal_actions'
-      見つからなければ []
-    """
-    if not isinstance(entry, dict):
-        return []
-
-    # 1) top-level
-    la = entry.get("legal_actions")
-    if isinstance(la, list) and la:
-        return la
-
-    # 2) action_result 直下
-    ar = entry.get("action_result") or {}
-    if isinstance(ar, dict):
-        la2 = ar.get("legal_actions")
-        if isinstance(la2, list) and la2:
-            return la2
-
-        # 3) substeps を後ろから
-        subs = ar.get("substeps")
-        if isinstance(subs, list) and subs:
-            for st in reversed(subs):
-                if isinstance(st, dict):
-                    la3 = st.get("legal_actions")
-                    if isinstance(la3, list) and la3:
-                        return la3
-
-    # 4) state_before / state_after 直下
-    for k in ("state_before", "state_after"):
-        st = entry.get(k) or {}
-        if isinstance(st, dict):
-            la4 = st.get("legal_actions")
-            if isinstance(la4, list) and la4:
-                return la4
-
-    # 5) state_* の me / opp 内
-    for k in ("state_before", "state_after"):
-        st = entry.get(k) or {}
-        if isinstance(st, dict):
-            for side in ("me", "opp"):
-                s = st.get(side) or {}
-                if isinstance(s, dict):
-                    la5 = s.get("legal_actions")
-                    if isinstance(la5, list) and la5:
-                        return la5
-
-    return []
 
 class CardNameToIdConverter:
     # ----------------------------------------------
