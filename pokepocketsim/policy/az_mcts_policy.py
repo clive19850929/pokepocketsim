@@ -136,6 +136,7 @@ class AlphaZeroMCTSPolicy:
         if os.getenv("AZ_DECISION_LOG", "0") == "1":
             try:
                 print(f"[AZ][INIT] use_mcts={int(self.use_mcts)} sims={int(self.num_simulations)}", flush=True)
+                print(f"[AZ][FILECHECK] __file__={__file__} has_CALL_RUN_MCTS_ALWAYS={('CALL_RUN_MCTS_ALWAYS' in open(__file__, encoding='utf-8', errors='ignore').read())} co_consts_has_CALL_RUN_MCTS_ALWAYS={('CALL_RUN_MCTS_ALWAYS' in (getattr(getattr(getattr(getattr(self, 'select_action', None), '__func__', getattr(self, 'select_action', None)), '__code__', None), 'co_consts', ()) or ())) }", flush=True)
             except Exception:
                 pass
 
@@ -671,6 +672,7 @@ class AlphaZeroMCTSPolicy:
                 else:
                     # cand_dim!=5 の場合のみ action_encoder_fn を要求
                     if self.action_encoder_fn is None:
+                        print(f"[AZ][MCTS][UNIFORM_EARLY_ALWAYS] file={__file__} reason=no_action_encoder cand_dim={int(cdim)}", flush=True)
                         return self._uniform_pi(legal_action_ids)
                     for aid in legal_action_ids:
                         try:
@@ -729,6 +731,15 @@ class AlphaZeroMCTSPolicy:
             probs = (probs / s).tolist()
 
             decision_src = "model"
+
+            try:
+                if os.getenv("AZ_DECISION_LOG", "0") == "1":
+                    print(
+                        f"[AZ][MCTS][BEFORE_GATE_ALWAYS] use_mcts={int(use_mcts)} env={env_name_always} sims={int(num_sims)} n_actions={int(len(legal_action_ids))}",
+                        flush=True,
+                    )
+            except Exception:
+                pass
 
             # --- MCTS が有効な場合は、visit count ベースの π で上書き ---
             if os.getenv("AZ_DECISION_LOG", "0") == "1":
@@ -1150,6 +1161,51 @@ class AlphaZeroMCTSPolicy:
                 try:
                     print(
                         f"[AZ][DECISION][CALL_SELECT] game_id={_gid} turn={_turn} use_mcts={int(use_mcts)} sims={int(num_sims)} env={_env_name}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
+            if _az_log:
+                try:
+                    _fn_inst = getattr(self, "select_action", None)
+                    _fn_cls = getattr(getattr(self, "__class__", None), "select_action", None)
+
+                    _shadow = False
+                    try:
+                        _shadow = ("select_action" in getattr(self, "__dict__", {}))
+                    except Exception:
+                        _shadow = False
+
+                    def _get_code(_fn):
+                        _code = None
+                        try:
+                            _code = getattr(_fn, "__code__", None)
+                        except Exception:
+                            _code = None
+                        if _code is None:
+                            try:
+                                _code = getattr(getattr(_fn, "__func__", None), "__code__", None)
+                            except Exception:
+                                _code = None
+                        return _code
+
+                    _code_inst = _get_code(_fn_inst)
+                    _code_cls = _get_code(_fn_cls)
+
+                    _inst_file = _code_inst.co_filename if _code_inst is not None else "?"
+                    _inst_line = int(_code_inst.co_firstlineno) if _code_inst is not None else -1
+                    _inst_name = getattr(_fn_inst, "__qualname__", getattr(_fn_inst, "__name__", "select_action"))
+
+                    _cls_file = _code_cls.co_filename if _code_cls is not None else "?"
+                    _cls_line = int(_code_cls.co_firstlineno) if _code_cls is not None else -1
+                    _cls_name = getattr(_fn_cls, "__qualname__", getattr(_fn_cls, "__name__", "select_action"))
+
+                    print(
+                        f"[AZ][DEBUG][SELECT_ACTION_BINDING] game_id={_gid} turn={_turn} "
+                        f"shadow={int(_shadow)} "
+                        f"inst=file={_inst_file} line={_inst_line} name={_inst_name} "
+                        f"cls=file={_cls_file} line={_cls_line} name={_cls_name}",
                         flush=True,
                     )
                 except Exception:
