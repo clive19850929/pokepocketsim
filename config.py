@@ -16,6 +16,8 @@ import os
 
 __all__ = [
     "ALWAYS_OUTPUT_BOTH_IDS",
+    "AZ_ACTION_ENCODER_FN32",
+    "AZ_ACTION_ENCODER_FN32_SPEC",
     "AZ_MCTS_NUM_SIMULATIONS",
     "BATCH_FLUSH_INTERVAL",
     "CPU_WORKERS_MCC",
@@ -97,6 +99,26 @@ SELFPLAY_ALPHAZERO_MODE = True の場合でも、次は「併用」できるよ�
 SELFPLAY_ALPHAZERO_MODE = True
 USE_MCTS_POLICY = True
 AZ_MCTS_NUM_SIMULATIONS = 64  # AlphaZero MCTS のシミュレーション回数（チューニング用）
+
+# === 必須: cand_dim!=5 のモデルで使う action encoder（fn32）をコードで固定 ===
+# policy_factory.py はここ（config.py）だけを唯一の正として参照し、取れなければ即エラー停止します。
+# ダミー注入・自動探索は禁止なので、未実装のまま実行すると必ず停止します（意図通り）。
+AZ_ACTION_ENCODER_PROBE_ACTION_ID = 0
+
+def encode_action_32d(action_id: int) -> list[float]:
+    """
+    action_id -> 32次元ベクトル（list[float], len=32）を返す関数をここに実装してください。
+    未実装のまま動かすと policy_factory の注入直後 probe で必ず止まります（ダミーで進みません）。
+    """
+    raise NotImplementedError(
+        "config.py: encode_action_32d(action_id) を実装してください（list[float] len=32 を必ず返す）"
+    )
+
+# policy_factory 側が最優先で読む “callable 本体”
+AZ_ACTION_ENCODER_FN32 = encode_action_32d
+
+# （任意）SPEC を使わないので空でOK。設定が残っていても callable 優先にします。
+AZ_ACTION_ENCODER_FN32_SPEC = ""
 
 # どの方策を使うか
 #   "az_mcts"    : AlphaZero 方式。MCTS内部でモデルを使い、最終手はMCTSの訪問回数から選ぶ

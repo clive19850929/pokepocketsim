@@ -148,11 +148,10 @@ def _resolve_action_encoder_fn32_from_config(tag: str = ""):
 
     return fn, "ok(spec)"
 
-
 def _attach_action_encoder_fn32_required(pol, tag: str = ""):
     """
-    cand_dim!=5 の AlphaZeroMCTSPolicy に、fn(action_id)->list[float](len=32) を必須注入する。
-    受け取れない場合は原因ログを出して即死する（自動探索・ダミー注入は禁止）。
+    cand_dim!=5 の AlphaZeroMCTSPolicy に、fn(action_id)->list[float](len=cand_dim) を必須注入する。
+    受け取れない場合は原因ログを出して即死する（自動探索・ダミー注入・自動次元合わせは禁止）。
     """
     cdim = 0
     try:
@@ -220,7 +219,115 @@ def _attach_action_encoder_fn32_required(pol, tag: str = ""):
             pass
         raise RuntimeError("[AZ][ENCODER][FATAL] policy has no set_action_encoder(fn)")
 
-    setter(fn)
+    def _wrapped(action_id):
+        v = fn(action_id)
+
+        if isinstance(v, tuple):
+            v = list(v)
+
+        if not isinstance(v, list):
+            try:
+                tl = getattr(v, "tolist", None)
+            except Exception:
+                tl = None
+            if callable(tl):
+                try:
+                    v = tl()
+                except Exception:
+                    v = None
+                if isinstance(v, tuple):
+                    v = list(v)
+
+        if not isinstance(v, list):
+            try:
+                v = list(v)
+            except Exception:
+                v = None
+
+        if (not isinstance(v, list)) or (len(v) != int(cdim)):
+            raise RuntimeError(
+                f"[AZ][ENCODER][FATAL] tag={tag} encoder returned invalid vector "
+                f"(need len={int(cdim)}) got={type(v)} len={(len(v) if isinstance(v, list) else 'NA')}"
+            )
+
+        out = []
+        for x in v:
+            out.append(float(x))
+        return out
+
+    try:
+        _wrapped(0)
+    except Exception as e:
+        try:
+            print(
+                f"[AZ][ENCODER][FATAL] tag={tag} cand_dim={int(cdim)} probe_failed err={type(e).__name__} {e!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        raise
+
+    setter(_wrapped)
+
+    # --- 必須: 注入した fn32 が「本当に呼べて」「len=32 を返す」ことをここで確定させる ---
+    _probe_aid = 0
+    try:
+        from config import AZ_ACTION_ENCODER_PROBE_ACTION_ID as _PROBE
+        _probe_aid = int(_PROBE)
+    except Exception:
+        _probe_aid = 0
+
+    try:
+        _probe_v = fn(int(_probe_aid))
+    except Exception as e:
+        try:
+            print(
+                f"[AZ][ENCODER][FATAL] tag={tag} cand_dim={int(cdim)} "
+                f"probe_aid={int(_probe_aid)} probe_exc={e!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        raise RuntimeError(f"[AZ][ENCODER][FATAL] fn32 probe failed: {e!r}")
+
+    if isinstance(_probe_v, tuple):
+        _probe_v = list(_probe_v)
+
+    if not isinstance(_probe_v, list) or len(_probe_v) != 32:
+        try:
+            _t = type(_probe_v).__name__
+            _l = (len(_probe_v) if isinstance(_probe_v, list) else None)
+        except Exception:
+            _t = "<?>"
+            _l = None
+        try:
+            print(
+                f"[AZ][ENCODER][FATAL] tag={tag} cand_dim={int(cdim)} "
+                f"probe_aid={int(_probe_aid)} probe_type={_t} probe_len={_l} (expected_len=32)",
+                flush=True,
+            )
+        except Exception:
+            pass
+        raise RuntimeError("[AZ][ENCODER][FATAL] fn32 must return list[float] len=32")
+
+    try:
+        for _x in _probe_v:
+            float(_x)
+    except Exception as e:
+        try:
+            print(
+                f"[AZ][ENCODER][FATAL] tag={tag} cand_dim={int(cdim)} "
+                f"probe_aid={int(_probe_aid)} non_numeric={e!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        raise RuntimeError("[AZ][ENCODER][FATAL] fn32 must return numeric list[float] len=32")
+
+    try:
+        setattr(pol, "_policy_factory_fn32_injected", True)
+    except Exception:
+        pass
 
     try:
         import inspect
@@ -246,7 +353,6 @@ def _attach_action_encoder_fn32_required(pol, tag: str = ""):
         )
     except Exception:
         pass
-
 
 from pokepocketsim.policy.random_policy import RandomPolicy
 
@@ -337,144 +443,12 @@ def _resolve_action_encoder_callable_from_env():
 
 def _attach_action_encoder_fn32_if_needed(pol, model_dir, tag=""):
     """
-    AlphaZeroMCTSPolicy 生成直後に呼ぶ。
-
-    - cand_dim == 5 なら不要なので何もしない
-    - cand_dim != 5 の場合:
-        * すでに action_encoder_fn が設定済みなら OK（ログ）
-        * 未設定なら AZ_ACTION_ENCODER_FN="module:function" が必須
-        * 解決できなければログを出して RuntimeError で停止（自動探索/ダミー注入はしない）
-        * 返り値次元が cand_dim と一致しなければログを出して RuntimeError で停止
+    互換用エントリポイント。
+    現行方針では env 参照や次元自動補正（ゼロ埋め/切り詰め）を禁止し、
+    config.py の指定を唯一の正として必須注入する。
     """
-    if pol is None:
-        raise RuntimeError(f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} pol=None")
-
-    fn_set = getattr(pol, "set_action_encoder", None)
-    if not callable(fn_set):
-        raise RuntimeError(
-            f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} "
-            f"class={type(pol).__name__} model_dir={model_dir} reason=set_action_encoder_not_found"
-        )
-
-    try:
-        cdim = int(getattr(pol, "cand_dim", 0) or 0)
-    except Exception:
-        cdim = 0
-
-    if cdim <= 0:
-        raise RuntimeError(
-            f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} "
-            f"class={type(pol).__name__} model_dir={model_dir} reason=cand_dim_invalid cand_dim={cdim}"
-        )
-
-    if cdim == 5:
-        if os.getenv("AZ_DECISION_LOG", "0") == "1":
-            print(
-                f"[POLICY_FACTORY][ACTION_ENCODER][OK] tag={tag} class={type(pol).__name__} "
-                f"model_dir={model_dir} cand_dim={int(cdim)} reason=cand_dim_5_no_need",
-                flush=True,
-            )
-        return
-
-    try:
-        _already = (getattr(pol, "action_encoder_fn", None) is not None)
-    except Exception:
-        _already = False
-
-    if _already:
-        if os.getenv("AZ_DECISION_LOG", "0") == "1":
-            print(
-                f"[POLICY_FACTORY][ACTION_ENCODER][OK] tag={tag} class={type(pol).__name__} "
-                f"model_dir={model_dir} cand_dim={int(cdim)} reason=already_set",
-                flush=True,
-            )
-        return
-
-    fn = None
-    src = None
-
-    fn, err = _resolve_action_encoder_callable_from_env()
-    if callable(fn):
-        src = err
-    else:
-        fn = None
-
-    if fn is None:
-        try:
-            spec = os.getenv("AZ_ACTION_ENCODER_FN", "")
-        except Exception:
-            spec = ""
-        if os.getenv("AZ_DECISION_LOG", "0") == "1":
-            print(
-                f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} class={type(pol).__name__} "
-                f"model_dir={model_dir} cand_dim={int(cdim)} reason=missing_encoder "
-                f"AZ_ACTION_ENCODER_FN={spec!r} env_resolve={err!r}",
-                flush=True,
-            )
-        raise RuntimeError(
-            f"[FATAL] action_encoder_fn is required when cand_dim!=5 (tag={tag}, cand_dim={cdim}). "
-            f"Set AZ_ACTION_ENCODER_FN='module:function'. env_resolve={err!r}"
-        )
-
-    def _wrapped(aid):
-        v = fn(aid)
-        out = _coerce_vec_dim(v, cdim)
-        return out
-
-    try:
-        _probe = _wrapped(0)
-    except Exception as e:
-        if os.getenv("AZ_DECISION_LOG", "0") == "1":
-            print(
-                f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} class={type(pol).__name__} "
-                f"model_dir={model_dir} cand_dim={int(cdim)} reason=probe_call_failed src={str(src)} err={e!r}",
-                flush=True,
-            )
-        raise RuntimeError(
-            f"[FATAL] action encoder probe call failed (tag={tag}, src={src}): {e!r}"
-        )
-
-    if not isinstance(_probe, list) or len(_probe) != int(cdim):
-        if os.getenv("AZ_DECISION_LOG", "0") == "1":
-            try:
-                _t = type(_probe).__name__
-                _l = (len(_probe) if isinstance(_probe, list) else None)
-            except Exception:
-                _t = "<?>"
-                _l = None
-            print(
-                f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} class={type(pol).__name__} "
-                f"model_dir={model_dir} cand_dim={int(cdim)} reason=bad_dim src={str(src)} "
-                f"probe_type={_t} probe_len={_l}",
-                flush=True,
-            )
-        raise RuntimeError(
-            f"[FATAL] action encoder returned wrong dim (tag={tag}, expected={cdim}, src={src})."
-        )
-
-    try:
-        fn_set(_wrapped)
-        try:
-            setattr(pol, "_policy_factory_action_encoder_src", str(src))
-        except Exception:
-            pass
-
-        if os.getenv("AZ_DECISION_LOG", "0") == "1":
-            print(
-                f"[POLICY_FACTORY][ACTION_ENCODER][OK] tag={tag} class={type(pol).__name__} "
-                f"model_dir={model_dir} cand_dim={int(cdim)} src={str(src)}",
-                flush=True,
-            )
-    except Exception as e:
-        if os.getenv("AZ_DECISION_LOG", "0") == "1":
-            print(
-                f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} class={type(pol).__name__} "
-                f"model_dir={model_dir} cand_dim={int(cdim)} reason=set_action_encoder_failed src={str(src)} err={e!r}",
-                flush=True,
-            )
-        raise RuntimeError(
-            f"[FATAL] set_action_encoder failed (tag={tag}, src={src}): {e!r}"
-        )
+    _attach_action_encoder_fn32_required(pol, tag=tag)
+    return
 
 def _wrap_select_action_with_phased_q(pol, tag):
     try:
