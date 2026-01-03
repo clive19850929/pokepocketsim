@@ -53,6 +53,232 @@ except Exception as _e:
 
 from pokepocketsim.policy.random_policy import RandomPolicy
 
+def _coerce_vec_dim(v, dim):
+    """
+    v を list[float] に正規化し、長さ dim に揃える（不足は 0.0 埋め、過剰は切り詰め）。
+    v が None / 変換不能なら None を返す。
+    """
+    if v is None:
+        return None
+
+    try:
+        d = int(dim)
+    except Exception:
+        d = 0
+    if d <= 0:
+        return None
+
+    # list / tuple
+    if isinstance(v, tuple):
+        v = list(v)
+
+    # numpy / torch / array-like (tolist)
+    if not isinstance(v, list):
+        try:
+            tl = getattr(v, "tolist", None)
+        except Exception:
+            tl = None
+        if callable(tl):
+            try:
+                vv = tl()
+            except Exception:
+                vv = None
+            if isinstance(vv, tuple):
+                vv = list(vv)
+            v = vv
+
+    if not isinstance(v, list):
+        return None
+
+    out = []
+    for x in v:
+        try:
+            out.append(float(x))
+        except Exception:
+            out.append(0.0)
+
+    if len(out) < d:
+        out += [0.0] * (d - len(out))
+    elif len(out) > d:
+        out = out[:d]
+
+    return out
+
+def _resolve_action_encoder_callable_from_env():
+    """
+    AZ_ACTION_ENCODER_FN="module:function" を最優先で解決する。
+    """
+    spec = None
+    try:
+        spec = os.getenv("AZ_ACTION_ENCODER_FN", None)
+        if spec is not None:
+            spec = str(spec).strip()
+    except Exception:
+        spec = None
+
+    if not spec:
+        return None, None
+
+    if ":" not in spec:
+        return None, f"bad_spec(no_colon):{spec}"
+
+    mod_name, fn_name = spec.split(":", 1)
+    mod_name = (mod_name or "").strip()
+    fn_name = (fn_name or "").strip()
+    if not mod_name or not fn_name:
+        return None, f"bad_spec(empty):{spec}"
+
+    try:
+        import importlib
+        m = importlib.import_module(mod_name)
+        fn = getattr(m, fn_name, None)
+        if callable(fn):
+            return fn, f"env:{spec}"
+        return None, f"not_callable:{spec}"
+    except Exception as e:
+        return None, f"import_fail:{spec} err={e!r}"
+
+def _attach_action_encoder_fn32_if_needed(pol, model_dir, tag=""):
+    """
+    AlphaZeroMCTSPolicy 生成直後に呼ぶ。
+
+    - cand_dim == 5 なら不要なので何もしない
+    - cand_dim != 5 の場合:
+        * すでに action_encoder_fn が設定済みなら OK（ログ）
+        * 未設定なら AZ_ACTION_ENCODER_FN="module:function" が必須
+        * 解決できなければログを出して RuntimeError で停止（自動探索/ダミー注入はしない）
+        * 返り値次元が cand_dim と一致しなければログを出して RuntimeError で停止
+    """
+    if pol is None:
+        raise RuntimeError(f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} pol=None")
+
+    fn_set = getattr(pol, "set_action_encoder", None)
+    if not callable(fn_set):
+        raise RuntimeError(
+            f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} "
+            f"class={type(pol).__name__} model_dir={model_dir} reason=set_action_encoder_not_found"
+        )
+
+    try:
+        cdim = int(getattr(pol, "cand_dim", 0) or 0)
+    except Exception:
+        cdim = 0
+
+    if cdim <= 0:
+        raise RuntimeError(
+            f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} "
+            f"class={type(pol).__name__} model_dir={model_dir} reason=cand_dim_invalid cand_dim={cdim}"
+        )
+
+    if cdim == 5:
+        if os.getenv("AZ_DECISION_LOG", "0") == "1":
+            print(
+                f"[POLICY_FACTORY][ACTION_ENCODER][OK] tag={tag} class={type(pol).__name__} "
+                f"model_dir={model_dir} cand_dim={int(cdim)} reason=cand_dim_5_no_need",
+                flush=True,
+            )
+        return
+
+    try:
+        _already = (getattr(pol, "action_encoder_fn", None) is not None)
+    except Exception:
+        _already = False
+
+    if _already:
+        if os.getenv("AZ_DECISION_LOG", "0") == "1":
+            print(
+                f"[POLICY_FACTORY][ACTION_ENCODER][OK] tag={tag} class={type(pol).__name__} "
+                f"model_dir={model_dir} cand_dim={int(cdim)} reason=already_set",
+                flush=True,
+            )
+        return
+
+    fn = None
+    src = None
+
+    fn, err = _resolve_action_encoder_callable_from_env()
+    if callable(fn):
+        src = err
+    else:
+        fn = None
+
+    if fn is None:
+        try:
+            spec = os.getenv("AZ_ACTION_ENCODER_FN", "")
+        except Exception:
+            spec = ""
+        if os.getenv("AZ_DECISION_LOG", "0") == "1":
+            print(
+                f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} class={type(pol).__name__} "
+                f"model_dir={model_dir} cand_dim={int(cdim)} reason=missing_encoder "
+                f"AZ_ACTION_ENCODER_FN={spec!r} env_resolve={err!r}",
+                flush=True,
+            )
+        raise RuntimeError(
+            f"[FATAL] action_encoder_fn is required when cand_dim!=5 (tag={tag}, cand_dim={cdim}). "
+            f"Set AZ_ACTION_ENCODER_FN='module:function'. env_resolve={err!r}"
+        )
+
+    def _wrapped(aid):
+        v = fn(aid)
+        out = _coerce_vec_dim(v, cdim)
+        return out
+
+    try:
+        _probe = _wrapped(0)
+    except Exception as e:
+        if os.getenv("AZ_DECISION_LOG", "0") == "1":
+            print(
+                f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} class={type(pol).__name__} "
+                f"model_dir={model_dir} cand_dim={int(cdim)} reason=probe_call_failed src={str(src)} err={e!r}",
+                flush=True,
+            )
+        raise RuntimeError(
+            f"[FATAL] action encoder probe call failed (tag={tag}, src={src}): {e!r}"
+        )
+
+    if not isinstance(_probe, list) or len(_probe) != int(cdim):
+        if os.getenv("AZ_DECISION_LOG", "0") == "1":
+            try:
+                _t = type(_probe).__name__
+                _l = (len(_probe) if isinstance(_probe, list) else None)
+            except Exception:
+                _t = "<?>"
+                _l = None
+            print(
+                f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} class={type(pol).__name__} "
+                f"model_dir={model_dir} cand_dim={int(cdim)} reason=bad_dim src={str(src)} "
+                f"probe_type={_t} probe_len={_l}",
+                flush=True,
+            )
+        raise RuntimeError(
+            f"[FATAL] action encoder returned wrong dim (tag={tag}, expected={cdim}, src={src})."
+        )
+
+    try:
+        fn_set(_wrapped)
+        try:
+            setattr(pol, "_policy_factory_action_encoder_src", str(src))
+        except Exception:
+            pass
+
+        if os.getenv("AZ_DECISION_LOG", "0") == "1":
+            print(
+                f"[POLICY_FACTORY][ACTION_ENCODER][OK] tag={tag} class={type(pol).__name__} "
+                f"model_dir={model_dir} cand_dim={int(cdim)} src={str(src)}",
+                flush=True,
+            )
+    except Exception as e:
+        if os.getenv("AZ_DECISION_LOG", "0") == "1":
+            print(
+                f"[POLICY_FACTORY][ACTION_ENCODER][FATAL] tag={tag} class={type(pol).__name__} "
+                f"model_dir={model_dir} cand_dim={int(cdim)} reason=set_action_encoder_failed src={str(src)} err={e!r}",
+                flush=True,
+            )
+        raise RuntimeError(
+            f"[FATAL] set_action_encoder failed (tag={tag}, src={src}): {e!r}"
+        )
+
 def _wrap_select_action_with_phased_q(pol, tag):
     try:
         if not USE_PHASED_Q:
@@ -994,6 +1220,80 @@ def build_policy(which: str, model_dir: str):
         pass
 
     def _ensure_az_select_action_env_compatible(_pol, _tag=""):
+        # Prefer instance-level binding to the core implementation so later class-level monkeypatch
+        # cannot break env= / cand_vecs= keyword arguments.
+        try:
+            import types as _types
+            if _pol is not None and hasattr(_pol, "_select_action_core"):
+                if not bool(getattr(_pol, "_select_action_shadowed", False)):
+                    try:
+                        _pol.select_action = _types.MethodType(_pol.__class__._select_action_core, _pol)
+                        _pol._select_action_shadowed = True
+                        if str(_tag):
+                            _pol._select_action_shadow_tag = str(_tag)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            import inspect
+            _fn = getattr(_pol, "select_action", None)
+            _sig = inspect.signature(_fn) if callable(_fn) else None
+            _has_env = False
+            _has_varkw = False
+            if _sig is not None:
+                _has_env = ("env" in _sig.parameters)
+                _has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values())
+            if not (_has_env or _has_varkw):
+                _pol.select_action = _pol.__class__.select_action.__get__(_pol, _pol.__class__)
+        except Exception:
+            pass
+
+        try:
+            _fn_inst = getattr(_pol, "select_action", None)
+            _fn_cls = getattr(getattr(_pol, "__class__", None), "select_action", None)
+
+            _shadow = False
+            try:
+                _shadow = ("select_action" in getattr(_pol, "__dict__", {}))
+            except Exception:
+                _shadow = False
+
+            def _get_code(_fn):
+                _code = None
+                try:
+                    _code = getattr(_fn, "__code__", None)
+                except Exception:
+                    _code = None
+                if _code is None:
+                    try:
+                        _code = getattr(getattr(_fn, "__func__", None), "__code__", None)
+                    except Exception:
+                        _code = None
+                return _code
+
+            _code_inst = _get_code(_fn_inst)
+            _code_cls = _get_code(_fn_cls)
+
+            _inst_file = _code_inst.co_filename if _code_inst is not None else "?"
+            _inst_line = int(_code_inst.co_firstlineno) if _code_inst is not None else -1
+            _inst_name = getattr(_fn_inst, "__qualname__", getattr(_fn_inst, "__name__", "select_action"))
+
+            _cls_file = _code_cls.co_filename if _code_cls is not None else "?"
+            _cls_line = int(_code_cls.co_firstlineno) if _code_cls is not None else -1
+            _cls_name = getattr(_fn_cls, "__qualname__", getattr(_fn_cls, "__name__", "select_action"))
+
+            print(
+                f"[POLICY_FACTORY][DEBUG][SELECT_ACTION_BINDING] tag={_tag} "
+                f"shadow={int(_shadow)} "
+                f"inst=file={_inst_file} line={_inst_line} name={_inst_name} "
+                f"cls=file={_cls_file} line={_cls_line} name={_cls_name}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
         try:
             import inspect
             _fn = getattr(_pol, "select_action", None)
@@ -1027,6 +1327,10 @@ def build_policy(which: str, model_dir: str):
             except Exception:
                 sims = 64
             setattr(pol, "num_simulations", sims)
+
+            _attach_action_encoder_fn32_if_needed(pol, model_dir=model_dir, tag="az_mcts(selfplay)")
+            _ensure_az_select_action_env_compatible(pol, _tag="az_mcts(selfplay)")
+
             return pol
         except Exception as e:
             raise RuntimeError(
@@ -1046,6 +1350,8 @@ def build_policy(which: str, model_dir: str):
                 setattr(pol, "use_mcts", False)
                 setattr(pol, "num_simulations", 0)
                 print("[POLICY] using AlphaZeroMCTSPolicy in model_only mode (MCTS disabled if supported)")
+                _attach_action_encoder_fn32_if_needed(pol, model_dir=model_dir, tag="az_model_only")
+                _ensure_az_select_action_env_compatible(pol, _tag="az_model_only")
             else:
                 # ★az_mcts/mcts 指定なら Selfplayフラグ無しでも MCTS を有効化する
                 setattr(pol, "use_mcts", True)
@@ -1055,6 +1361,8 @@ def build_policy(which: str, model_dir: str):
                     sims = 64
                 setattr(pol, "num_simulations", sims)
                 print(f"[POLICY] using AlphaZeroMCTSPolicy in MCTS mode (sims={sims})")
+                _attach_action_encoder_fn32_if_needed(pol, model_dir=model_dir, tag="az_mcts(normal)")
+                _ensure_az_select_action_env_compatible(pol, _tag="az_mcts(normal)")
             return pol
         except Exception as e:
             raise RuntimeError(
@@ -1076,22 +1384,14 @@ def build_policy(which: str, model_dir: str):
                 sims = 64
             setattr(main_pol, "num_simulations", sims)
 
-            # --- 重要: select_action が env= を受け取れないラッパに差し替わっている場合に備えて差し戻す ---
+            _attach_action_encoder_fn32_if_needed(main_pol, model_dir=model_dir, tag="online_mix.main")
+
+            # --- 重要: select_action の env= / cand_vecs= 互換を保証（instance に shadow binding） ---
             try:
-                import inspect
-                _fn = getattr(main_pol, "select_action", None)
-                _sig = inspect.signature(_fn) if callable(_fn) else None
-                _has_env = False
-                _has_varkw = False
-                if _sig is not None:
-                    _has_env = ("env" in _sig.parameters)
-                    _has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values())
-                if not (_has_env or _has_varkw):
-                    main_pol.select_action = main_pol.__class__.select_action.__get__(main_pol, main_pol.__class__)
-                    if os.getenv("AZ_DECISION_LOG", "0") == "1":
-                        print("[AZ][WRAP_FIX] rebound select_action to class method (env kwarg compatible)", flush=True)
+                _ensure_az_select_action_env_compatible(main_pol, _tag="online_mix.main")
             except Exception:
                 pass
+
 
             _dump_policy_entrypoint_where(main_pol, label="online_mix.main(before_wrap)")
 
@@ -1105,6 +1405,11 @@ def build_policy(which: str, model_dir: str):
             # PhaseD-Q: main 側にはラップしない（outer 側に統一して重複ログを防ぐ）
 
             _dump_policy_entrypoint_where(main_pol, label="online_mix.main(after_wrap)")
+            try:
+                _ensure_az_select_action_env_compatible(main_pol, _tag="online_mix.main(after_wrap)")
+            except Exception:
+                pass
+
 
             # フォールバック: RandomPolicy
             fallback_pol = RandomPolicy()

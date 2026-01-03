@@ -1,14 +1,20 @@
 # policy_trace_monkeypatch.py
 # -*- coding: utf-8 -*-
 """
-POLICY_TRACE=1 で ModelPolicy.select_action をラップし、以下を出力します。
+POLICY_TRACE=1 で ModelPolicy の選択をトレースし、以下を出力します。
 - 合法手のエンコード coverage（成功/総数）
 - エンコード失敗の例（最大3件）
 - 可能なら Q の上位 k 手（k=POLICY_TOPK, 既定5）
+
+また、AlphaZeroMCTSPolicy については「MCTS 経路を壊さずに」トレースするため、
+select_action を上書きせずに、以下のいずれかをラップします（存在する方）:
+- _select_action_core（推奨: select_action の中核）
+- _run_mcts（MCTS 本体）
+
 使い方:
   1) 本ファイルをプロジェクトの import パス上に置く（ai vs ai.py と同じ階層など）
   2) ai vs ai.py の先頭付近に `import policy_trace_monkeypatch` を1行追加
-     ※ 下の「追加ファイル②: sitecustomize.py」を使えば ai vs ai.py の修正は不要です
+     ※ sitecustomize.py 等で自動 import しても良い
   3) 実行時に環境変数 POLICY_TRACE=1 を設定（例: PowerShell → `$env:POLICY_TRACE=1`）
 """
 import os
@@ -76,7 +82,7 @@ else:
             return None
 
         def _wrap_select_action(orig_fn):
-            def _wrapped(self, state, legal_actions):
+            def _wrapped(self, state, legal_actions, *args, **kwargs):
                 import numpy as _np
                 # coverage を測定
                 ok = 0
@@ -121,7 +127,7 @@ else:
                     pass
 
                 # 本来の選択
-                result = orig_fn(self, state, legal_actions)
+                result = orig_fn(self, state, legal_actions, *args, **kwargs)
                 try:
                     action = result
                     pi = None
@@ -144,7 +150,9 @@ else:
         pass
 
 # ============================================================
-# AlphaZeroMCTSPolicy 用: MCTS π の簡易トレースと終了時サマリ
+# AlphaZeroMCTSPolicy 用: MCTS 経路を壊さずにトレース
+# - select_action は上書きしない
+# - _select_action_core または _run_mcts をラップ
 # ============================================================
 
 if os.getenv("POLICY_TRACE", "0") == "1":
@@ -157,6 +165,8 @@ if os.getenv("POLICY_TRACE", "0") == "1":
         "pi_missing": 0,
         "len_match": 0,
         "len_mismatch": 0,
+        "entered_core": 0,
+        "entered_run_mcts": 0,
     }
 
     try:
@@ -165,55 +175,67 @@ if os.getenv("POLICY_TRACE", "0") == "1":
     except Exception:
         AlphaZeroMCTSPolicy = None
 
-    if AlphaZeroMCTSPolicy is not None and hasattr(AlphaZeroMCTSPolicy, "select_action") and callable(AlphaZeroMCTSPolicy.select_action):
-
-        def _wrap_az_select_action(orig_fn):
-            def _wrapped(self, state, legal_actions):
-                # 本来の選択をまず実行
-                res = orig_fn(self, state, legal_actions)
-
-                # 結果から π を取得（(action, pi) 形式 or self.last_pi 想定）
+    def _trace_pi_and_update(legal_actions, res):
+        pi = None
+        if isinstance(res, tuple) and len(res) == 2:
+            _, pi = res
+        else:
+            try:
+                pi = getattr(res, "pi", None)
+            except Exception:
                 pi = None
-                if isinstance(res, tuple) and len(res) == 2:
-                    _, pi = res
-                else:
-                    pi = getattr(self, "last_pi", None)
 
-                la_len = len(legal_actions or [])
-                has_pi = isinstance(pi, (list, tuple))
-                pi_len = len(pi) if has_pi else 0
-                pi_sum = float(sum(pi)) if has_pi else 0.0
-                nz = int(sum(1 for v in pi if abs(v) > 1e-8)) if has_pi else 0
+        la_len = len(legal_actions or [])
+        has_pi = isinstance(pi, (list, tuple))
+        pi_len = len(pi) if has_pi else 0
+        pi_sum = float(sum(pi)) if has_pi else 0.0
+        nz = int(sum(1 for v in pi if abs(v) > 1e-8)) if has_pi else 0
 
-                # 統計更新
-                _AZ_TRACE_STATS["calls"] += 1
-                if has_pi:
-                    _AZ_TRACE_STATS["pi_present"] += 1
-                    if pi_len == la_len:
-                        _AZ_TRACE_STATS["len_match"] += 1
-                    else:
-                        _AZ_TRACE_STATS["len_mismatch"] += 1
-                else:
-                    _AZ_TRACE_STATS["pi_missing"] += 1
+        _AZ_TRACE_STATS["calls"] += 1
+        if has_pi:
+            _AZ_TRACE_STATS["pi_present"] += 1
+            if pi_len == la_len:
+                _AZ_TRACE_STATS["len_match"] += 1
+            else:
+                _AZ_TRACE_STATS["len_mismatch"] += 1
+        else:
+            _AZ_TRACE_STATS["pi_missing"] += 1
 
-                # 直近トレースの保存
-                _AZ_TRACE_RECENT.append({
-                    "la_len": la_len,
-                    "pi_len": pi_len,
-                    "pi_sum": pi_sum,
-                    "nz": nz,
-                })
+        _AZ_TRACE_RECENT.append({
+            "la_len": la_len,
+            "pi_len": pi_len,
+            "pi_sum": pi_sum,
+            "nz": nz,
+        })
 
+    if AlphaZeroMCTSPolicy is not None:
+
+        def _wrap_az_core(orig_fn):
+            def _wrapped(self, state, legal_actions, *args, **kwargs):
+                _AZ_TRACE_STATS["entered_core"] += 1
+                res = orig_fn(self, state, legal_actions, *args, **kwargs)
+                try:
+                    _trace_pi_and_update(legal_actions, res)
+                except Exception:
+                    pass
                 return res
-
             return _wrapped
 
-        # AlphaZeroMCTSPolicy.select_action をラップ
-        AlphaZeroMCTSPolicy.select_action = _wrap_az_select_action(AlphaZeroMCTSPolicy.select_action)
+        def _wrap_az_run_mcts(orig_fn):
+            def _wrapped(self, *args, **kwargs):
+                _AZ_TRACE_STATS["entered_run_mcts"] += 1
+                return orig_fn(self, *args, **kwargs)
+            return _wrapped
+
+        # 可能なら _select_action_core をラップ（select_action は上書きしない）
+        if hasattr(AlphaZeroMCTSPolicy, "_select_action_core") and callable(getattr(AlphaZeroMCTSPolicy, "_select_action_core", None)):
+            AlphaZeroMCTSPolicy._select_action_core = _wrap_az_core(AlphaZeroMCTSPolicy._select_action_core)
+        elif hasattr(AlphaZeroMCTSPolicy, "_run_mcts") and callable(getattr(AlphaZeroMCTSPolicy, "_run_mcts", None)):
+            AlphaZeroMCTSPolicy._run_mcts = _wrap_az_run_mcts(AlphaZeroMCTSPolicy._run_mcts)
 
         def _dump_az_trace_summary():
-            """プロセス終了時に AlphaZeroMCTSPolicy の π サマリを出力する。"""
-            if _AZ_TRACE_STATS["calls"] == 0:
+            """プロセス終了時に AlphaZeroMCTSPolicy のトレースサマリを出力する。"""
+            if _AZ_TRACE_STATS["calls"] == 0 and _AZ_TRACE_STATS["entered_core"] == 0 and _AZ_TRACE_STATS["entered_run_mcts"] == 0:
                 return
 
             print(
@@ -222,7 +244,9 @@ if os.getenv("POLICY_TRACE", "0") == "1":
                 f"pi_present={_AZ_TRACE_STATS['pi_present']} "
                 f"pi_missing={_AZ_TRACE_STATS['pi_missing']} "
                 f"len_match={_AZ_TRACE_STATS['len_match']} "
-                f"len_mismatch={_AZ_TRACE_STATS['len_mismatch']}"
+                f"len_mismatch={_AZ_TRACE_STATS['len_mismatch']} "
+                f"entered_core={_AZ_TRACE_STATS['entered_core']} "
+                f"entered_run_mcts={_AZ_TRACE_STATS['entered_run_mcts']}"
             )
 
             # 直近のトレース（最大 10 件）を詳細表示
