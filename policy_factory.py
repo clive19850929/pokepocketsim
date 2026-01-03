@@ -51,6 +51,203 @@ except Exception as _e:
     except Exception:
         pass
 
+def _resolve_action_encoder_fn32_from_env(tag: str = ""):
+    """
+    AZ_ACTION_ENCODER_FN="module:function" を唯一の正として解決する。
+    自動探索はしない。解決できなければ理由を出して例外停止する（呼び出し側で）。
+    """
+    spec = ""
+    try:
+        spec = str(os.getenv("AZ_ACTION_ENCODER_FN", "") or "").strip()
+    except Exception:
+        spec = ""
+
+    if not spec:
+        return None, "AZ_ACTION_ENCODER_FN is empty"
+
+    if ":" not in spec:
+        return None, "AZ_ACTION_ENCODER_FN must be 'module:function'"
+
+    mod_name, fn_name = spec.split(":", 1)
+    mod_name = str(mod_name or "").strip()
+    fn_name = str(fn_name or "").strip()
+
+    if not mod_name or not fn_name:
+        return None, "AZ_ACTION_ENCODER_FN must be 'module:function' (both non-empty)"
+
+    try:
+        import importlib
+        mod = importlib.import_module(mod_name)
+    except Exception as e:
+        return None, f"import_module failed: {type(e).__name__} {e!r}"
+
+    fn = None
+    try:
+        fn = getattr(mod, fn_name, None)
+    except Exception:
+        fn = None
+
+    if not callable(fn):
+        return None, f"resolved attr is not callable: module={mod_name} attr={fn_name}"
+
+    # ここでは「呼べる」ことまで（戻りlen=32検証は action_id が要るので select_action 側で落ちる）
+    return fn, "ok"
+
+def _resolve_action_encoder_fn32_from_config(tag: str = ""):
+    """
+    config.py から fn32 を解決する（唯一の正）。
+    - AZ_ACTION_ENCODER_FN32: callable を直接渡す
+    - AZ_ACTION_ENCODER_FN32_SPEC: "module:function" で指定する
+    どちらも無ければエラー（自動探索・ダミー注入は禁止）。
+    """
+    _fn = None
+    _spec = ""
+
+    try:
+        from config import AZ_ACTION_ENCODER_FN32 as _C_FN
+        _fn = _C_FN
+    except Exception:
+        _fn = None
+
+    if callable(_fn):
+        return _fn, "ok(callable)"
+
+    try:
+        from config import AZ_ACTION_ENCODER_FN32_SPEC as _C_SPEC
+        _spec = str(_C_SPEC or "").strip()
+    except Exception:
+        _spec = ""
+
+    if not _spec:
+        return None, "missing both AZ_ACTION_ENCODER_FN32 (callable) and AZ_ACTION_ENCODER_FN32_SPEC ('module:function') in config.py"
+
+    if ":" not in _spec:
+        return None, "AZ_ACTION_ENCODER_FN32_SPEC must be 'module:function'"
+
+    mod_name, fn_name = _spec.split(":", 1)
+    mod_name = str(mod_name or "").strip()
+    fn_name = str(fn_name or "").strip()
+
+    if not mod_name or not fn_name:
+        return None, "AZ_ACTION_ENCODER_FN32_SPEC must be 'module:function' (both non-empty)"
+
+    try:
+        import importlib
+        mod = importlib.import_module(mod_name)
+    except Exception as e:
+        return None, f"import_module failed: {type(e).__name__} {e!r}"
+
+    fn = None
+    try:
+        fn = getattr(mod, fn_name, None)
+    except Exception:
+        fn = None
+
+    if not callable(fn):
+        return None, f"resolved attr is not callable: module={mod_name} attr={fn_name}"
+
+    return fn, "ok(spec)"
+
+
+def _attach_action_encoder_fn32_required(pol, tag: str = ""):
+    """
+    cand_dim!=5 の AlphaZeroMCTSPolicy に、fn(action_id)->list[float](len=32) を必須注入する。
+    受け取れない場合は原因ログを出して即死する（自動探索・ダミー注入は禁止）。
+    """
+    cdim = 0
+    try:
+        cdim = int(getattr(pol, "cand_dim", 0) or 0)
+    except Exception:
+        cdim = 0
+
+    if int(cdim) == 5:
+        try:
+            print(f"[AZ][ENCODER][SKIP] tag={tag} cand_dim=5 (fn32 not required)", flush=True)
+        except Exception:
+            pass
+        return
+
+    if int(cdim) <= 0:
+        try:
+            print(f"[AZ][ENCODER][FATAL] tag={tag} cand_dim<=0 cand_dim={cdim} (model metadata missing)", flush=True)
+        except Exception:
+            pass
+        raise RuntimeError(f"[AZ][ENCODER][FATAL] cand_dim<=0 cand_dim={cdim}")
+
+    fn, reason = _resolve_action_encoder_fn32_from_config(tag=tag)
+
+    if fn is None:
+        try:
+            cwd = os.getcwd()
+        except Exception:
+            cwd = "<?>"
+        try:
+            exe = sys.executable
+        except Exception:
+            exe = "<?>"
+        try:
+            import config as _cfg
+            cfg_file = getattr(_cfg, "__file__", None)
+        except Exception:
+            cfg_file = None
+
+        try:
+            print(
+                f"[AZ][ENCODER][FATAL] tag={tag} cand_dim={int(cdim)} reason={reason} "
+                f"cwd={cwd!r} exe={exe!r} policy_factory={__file__!r} config_file={cfg_file!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+        try:
+            head = sys.path[:12]
+            print(f"[AZ][ENCODER][FATAL] sys.path.head={head!r}", flush=True)
+        except Exception:
+            pass
+
+        raise RuntimeError(f"[AZ][ENCODER][FATAL] fn32 unresolved: {reason}")
+
+    setter = getattr(pol, "set_action_encoder", None)
+    if not callable(setter):
+        try:
+            print(
+                f"[AZ][ENCODER][FATAL] tag={tag} cand_dim={int(cdim)} "
+                f"policy_has_set_action_encoder=0 class={type(pol).__name__} file={__file__!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        raise RuntimeError("[AZ][ENCODER][FATAL] policy has no set_action_encoder(fn)")
+
+    setter(fn)
+
+    try:
+        import inspect
+        mod = inspect.getmodule(fn)
+        mod_file = getattr(mod, "__file__", None) if mod is not None else None
+    except Exception:
+        mod_file = None
+
+    try:
+        code = getattr(fn, "__code__", None)
+        fn_file = code.co_filename if code is not None else "<?>"
+        fn_line = int(code.co_firstlineno) if code is not None else -1
+    except Exception:
+        fn_file = "<?>"
+        fn_line = -1
+
+    try:
+        print(
+            f"[AZ][ENCODER][OK] tag={tag} cand_dim={int(cdim)} "
+            f"fn={getattr(fn, '__qualname__', getattr(fn, '__name__', 'fn'))} "
+            f"fn_file={fn_file!r} fn_line={int(fn_line)} module_file={mod_file!r}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 from pokepocketsim.policy.random_policy import RandomPolicy
 
 def _coerce_vec_dim(v, dim):
@@ -1320,6 +1517,10 @@ def build_policy(which: str, model_dir: str):
             from pokepocketsim.policy.az_mcts_policy import AlphaZeroMCTSPolicy
 
             pol = AlphaZeroMCTSPolicy(model_dir=model_dir)
+
+            # ★必須: cand_dim!=5 のとき fn32 を環境変数から解決して注入（失敗ならここで即死）
+            _attach_action_encoder_fn32_required(pol, tag="az_mcts(selfplay)")
+
             # MCTS 有効モード: policy 側のフラグを ON（シミュレーション回数は先頭設定から取得）
             setattr(pol, "use_mcts", True)
             try:
@@ -1343,6 +1544,10 @@ def build_policy(which: str, model_dir: str):
         try:
             from pokepocketsim.policy.az_mcts_policy import AlphaZeroMCTSPolicy
             pol = AlphaZeroMCTSPolicy(model_dir=model_dir)
+
+            # ★必須: cand_dim!=5 のとき fn32 を環境変数から解決して注入（失敗ならここで即死）
+            _attach_action_encoder_fn32_required(pol, tag=f"az({'model_only' if is_model_only else 'mcts'})")
+
             if is_model_only:
                 # ★モデルのみモード（MCTSを無効化するためのフラグをポリシー側に渡す）
                 setattr(pol, "disable_mcts", True)
@@ -1377,6 +1582,10 @@ def build_policy(which: str, model_dir: str):
 
             # メイン: MCTS 付き AlphaZero 方策
             main_pol = AlphaZeroMCTSPolicy(model_dir=model_dir)
+
+            # ★必須: cand_dim!=5 のとき fn32 を環境変数から解決して注入（失敗ならここで即死）
+            _attach_action_encoder_fn32_required(main_pol, tag="online_mix.main")
+
             setattr(main_pol, "use_mcts", True)
             try:
                 sims = int(AZ_MCTS_NUM_SIMULATIONS)
