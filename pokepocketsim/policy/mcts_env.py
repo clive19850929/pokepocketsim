@@ -1205,6 +1205,28 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
 
         return ids if isinstance(ids, list) else []
 
+    def debug_validate_action_roundtrip(self) -> None:
+        """
+        最小自己検証:
+        - 同一状態で legal_actions を複数回取得しても 5-int が不変
+        - 取得した 5-int を step に渡して復元・適用できる
+        """
+        ids_first = list(self.legal_actions())
+        ids_second = list(self.legal_actions())
+
+        if ids_first != ids_second:
+            raise RuntimeError(
+                "MatchPlayerSimEnv.debug_validate_action_roundtrip: legal_actions 5-int output is unstable "
+                f"ids_first={ids_first} ids_second={ids_second}"
+            )
+
+        if not ids_first:
+            return
+
+        # 元環境を汚さないために clone() で step を確認する
+        clone_env = self.clone()
+        clone_env.step(ids_first[0])
+
     def step(self, action: Any) -> None:
         """
         指定された action（5-int ID）を 1手適用して内部状態を進める。

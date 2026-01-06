@@ -241,8 +241,11 @@ class Action:
             out[2] = prize_idx
         elif self.action_type in (ActionType.PLAY_BENCH, ActionType.ATTACH_TOOL, ActionType.USE_ITEM,
                                 ActionType.USE_SUPPORTER, ActionType.PLAY_STADIUM,
-                                ActionType.RETREAT, ActionType.SET_ACTIVE_CARD):
+                                ActionType.SET_ACTIVE_CARD):
             out[2] = bench_idx  # ベンチ対象のあるカードはここに入れる慣習
+        elif self.action_type == ActionType.RETREAT:
+            # 逃げる行動そのものはターゲット未選択として安定させる（選択は substep で持つ）
+            out[2] = 0
 
         # END_TURN などは 0 のまま
         _emit_mcts_dbg()
