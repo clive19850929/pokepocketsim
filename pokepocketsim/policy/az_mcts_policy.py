@@ -534,7 +534,64 @@ class AlphaZeroMCTSPolicy:
             if env is None:
                 raise RuntimeError("[AZ] use_mcts=1 but env is None (no fallback).")
 
-            mcts_pi = self._run_mcts(env, legal_action_ids, num_simulations=num_sims)
+            try:
+                mcts_pi = self._run_mcts(env, legal_action_ids, num_simulations=num_sims)
+            except Exception as e:
+                import time
+                import traceback
+                from ..debug_dump import write_debug_dump
+
+                m = getattr(env, "_match", None)
+                p = getattr(env, "_player", None)
+                forced_active = None
+                try:
+                    fa = getattr(m, "forced_actions", None) if m is not None else None
+                    if isinstance(fa, (list, tuple)):
+                        forced_active = len(fa) > 0
+                except Exception:
+                    forced_active = None
+
+                legal_actions_serialized = []
+                try:
+                    for i, vec in enumerate(legal_action_ids):
+                        if isinstance(vec, tuple):
+                            vec = list(vec)
+                        if not isinstance(vec, list):
+                            vec = [0, 0, 0, 0, 0]
+                        if len(vec) < 5:
+                            vec = list(vec) + [0] * (5 - len(vec))
+                        if len(vec) > 5:
+                            vec = list(vec)[:5]
+                        legal_actions_serialized.append(
+                            {"i": i, "action_type": None, "name": None, "vec": vec}
+                        )
+                except Exception:
+                    legal_actions_serialized = []
+
+                payload = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                    "run_context": {
+                        "game_id": getattr(m, "game_id", None) if m is not None else None,
+                        "turn": getattr(m, "turn", None) if m is not None else None,
+                        "player": getattr(p, "name", None) if p is not None else None,
+                        "forced_actions_active": forced_active,
+                    },
+                    "action_context": {
+                        "selected_vec": None,
+                        "selected_source": "mcts",
+                        "legal_actions_serialized": legal_actions_serialized,
+                    },
+                    "mcts_context": {
+                        "num_simulations": int(num_sims),
+                        "n_actions": int(len(legal_action_ids)),
+                    },
+                    "traceback": traceback.format_exception(type(e), e, e.__traceback__),
+                }
+                dump_path = write_debug_dump(payload)
+                print(f"[DEBUG_DUMP] wrote: {dump_path}", flush=True)
+                raise
             if not (isinstance(mcts_pi, list) and int(len(mcts_pi)) == int(len(legal_action_ids))):
                 raise RuntimeError("[AZ] _run_mcts returned invalid pi (no fallback).")
             probs = mcts_pi
@@ -815,6 +872,7 @@ class AlphaZeroMCTSPolicy:
             root.children[k] = MCTSNode(parent=root, prior=float(p), state_key=None, action_from_parent=aid)
 
         sim_ok = 0
+        sim_err = 0
 
         mute = os.getenv("AZ_MCTS_MUTE", "1") == "1"
         echo = os.getenv("AZ_MCTS_ECHO", ("1" if mute else "0")) == "1"
@@ -939,6 +997,7 @@ class AlphaZeroMCTSPolicy:
 
                     sim_ok += 1
                 except Exception as e:
+                    sim_err += 1
                     try:
                         extra = ""
                         if mute and buf is not None:
@@ -987,6 +1046,102 @@ class AlphaZeroMCTSPolicy:
 
         total_visits = float(sum(visit_counts))
         if not (total_visits > 0.0):
+            ctx_game_id = None
+            ctx_turn = None
+            ctx_player = None
+            ctx_forced = None
+            ctx_forced_len = None
+            try:
+                m = getattr(env, "_match", None)
+                ctx_game_id = getattr(m, "game_id", None) if m is not None else None
+                ctx_turn = getattr(m, "turn", None) if m is not None else None
+            except Exception:
+                ctx_game_id = None
+                ctx_turn = None
+            try:
+                p = getattr(env, "_player", None)
+                ctx_player = getattr(p, "name", None) if p is not None else None
+            except Exception:
+                ctx_player = None
+            try:
+                fn = getattr(env, "_forced_is_active", None)
+                if callable(fn):
+                    ctx_forced = bool(fn())
+            except Exception:
+                ctx_forced = None
+            try:
+                fn = getattr(env, "_get_forced_actions_raw", None)
+                if callable(fn):
+                    fr = fn()
+                    if isinstance(fr, (list, tuple)):
+                        ctx_forced_len = int(len(fr))
+            except Exception:
+                ctx_forced_len = None
+            try:
+                print(
+                    "[AZ][MCTS][TOTAL_VISITS_ZERO]"
+                    f" game_id={ctx_game_id}"
+                    f" turn={ctx_turn}"
+                    f" player={ctx_player}"
+                    f" forced_active={ctx_forced}"
+                    f" forced_len={ctx_forced_len}"
+                    f" n_actions={int(len(legal_action_ids))}"
+                    f" num_simulations={int(sims)}"
+                    f" sim_ok={int(sim_ok)}"
+                    f" sim_err={int(sim_err)}"
+                    f" root_children={int(len(root.children))}"
+                    f" root_N={getattr(root, 'N', None)}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            try:
+                import time
+                from ..debug_dump import write_debug_dump
+
+                def _coerce_vec(v):
+                    if isinstance(v, tuple):
+                        v = list(v)
+                    if not isinstance(v, list):
+                        v = [0, 0, 0, 0, 0]
+                    if len(v) < 5:
+                        v = list(v) + [0] * (5 - len(v))
+                    if len(v) > 5:
+                        v = list(v)[:5]
+                    return v
+
+                payload = {
+                    "error_type": "total_visits<=0",
+                    "error_message": "[AZ][MCTS] total_visits<=0 (no fallback).",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                    "run_context": {
+                        "game_id": ctx_game_id,
+                        "turn": ctx_turn,
+                        "player": ctx_player,
+                        "forced_actions_active": ctx_forced,
+                    },
+                    "action_context": {
+                        "selected_vec": None,
+                        "selected_source": "mcts",
+                        "legal_actions_serialized": [
+                            {"i": i, "action_type": None, "name": None, "vec": _coerce_vec(aid)}
+                            for i, aid in enumerate(legal_action_ids)
+                        ],
+                    },
+                    "mcts_context": {
+                        "num_simulations": int(sims),
+                        "total_visits": float(total_visits),
+                        "n_actions": int(len(legal_action_ids)),
+                        "any_exception_counters": {
+                            "sim_ok": int(sim_ok),
+                            "sim_err": int(sim_err),
+                        },
+                    },
+                }
+                dump_path = write_debug_dump(payload)
+                print(f"[DEBUG_DUMP] wrote: {dump_path}", flush=True)
+            except Exception:
+                pass
             raise RuntimeError("[AZ][MCTS] total_visits<=0 (no fallback).")
 
         pi_temp = float(getattr(self, "mcts_pi_temperature", 1.0) or 1.0)
