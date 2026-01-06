@@ -670,9 +670,141 @@ class OnlineMixedPolicy:
                 return idx_i
         except Exception as e:
             import os
+            import time
+            import traceback
+            from ..debug_dump import write_debug_dump
             self.stats_errors += 1
             policy_name = getattr(policy, "__class__", type(policy)).__name__
-            print(f"[ONLINE_MIX][ERROR] policy={policy_name} kind={kind} failed in select_action_index(_online): {e!r}")
+            game_id = None
+            turn = None
+            player_name = None
+            forced_active = None
+            forced_len = None
+            try:
+                m = getattr(player, "match", None) if player is not None else None
+                game_id = getattr(m, "game_id", None) if m is not None else None
+                turn = getattr(m, "turn", None) if m is not None else None
+                if m is not None:
+                    fa = getattr(m, "forced_actions", None)
+                    if isinstance(fa, (list, tuple)):
+                        forced_len = int(len(fa))
+                        forced_active = forced_len > 0
+            except Exception:
+                game_id = None
+                turn = None
+                forced_active = None
+                forced_len = None
+            try:
+                player_name = getattr(player, "name", None) if player is not None else None
+            except Exception:
+                player_name = None
+            print(
+                "[ONLINE_MIX][ERROR]"
+                f" game_id={game_id}"
+                f" turn={turn}"
+                f" player={player_name}"
+                f" forced_active={forced_active}"
+                f" forced_len={forced_len}"
+                f" policy={policy_name}"
+                f" kind={kind}"
+                f" mix_prob={float(getattr(self, 'mix_prob', 0.0))}"
+                f" main_policy={getattr(getattr(self, 'main_policy', None), '__class__', type(None)).__name__}"
+                f" fallback_policy={getattr(getattr(self, 'fallback_policy', None), '__class__', type(None)).__name__}"
+                f" fallback_calls={int(getattr(self, '_fallback_calls', 0) or 0)}"
+                f" failed_in=select_action_index(_online) err={e!r}",
+                flush=True,
+            )
+            try:
+                forced_active = None
+                forced_len = None
+                turn_ctx = None
+                player_ctx = None
+                game_id_ctx = None
+                if isinstance(state_dict, dict):
+                    turn_ctx = state_dict.get("turn", None)
+                try:
+                    m = getattr(player, "match", None) if player is not None else None
+                    game_id_ctx = getattr(m, "game_id", None) if m is not None else None
+                    turn_ctx = getattr(m, "turn", None) if m is not None else None
+                    player_ctx = getattr(player, "name", None) if player is not None else None
+                    fa = getattr(m, "forced_actions", None) if m is not None else None
+                    if isinstance(fa, (list, tuple)):
+                        forced_len = int(len(fa))
+                        forced_active = forced_len > 0
+                except Exception:
+                    game_id_ctx = None
+                    turn_ctx = None
+                    player_ctx = None
+                    forced_active = None
+                    forced_len = None
+
+                legal_actions_serialized = []
+                try:
+                    for i, a in enumerate(actions or []):
+                        vec = None
+                        try:
+                            fn = getattr(a, "to_id_vec", None)
+                            if callable(fn):
+                                try:
+                                    vec = fn(player=player)
+                                except TypeError:
+                                    vec = fn(player)
+                        except Exception:
+                            vec = None
+                        if vec is None:
+                            try:
+                                fn = getattr(a, "serialize", None)
+                                if callable(fn):
+                                    try:
+                                        vec = fn(player=player)
+                                    except TypeError:
+                                        vec = fn(player)
+                            except Exception:
+                                vec = None
+                        if isinstance(vec, tuple):
+                            vec = list(vec)
+                        if not isinstance(vec, list):
+                            vec = [0, 0, 0, 0, 0]
+                        if len(vec) < 5:
+                            vec = list(vec) + [0] * (5 - len(vec))
+                        if len(vec) > 5:
+                            vec = list(vec)[:5]
+
+                        legal_actions_serialized.append(
+                            {
+                                "i": i,
+                                "action_type": getattr(a, "action_type", None),
+                                "name": getattr(a, "name", None),
+                                "vec": vec,
+                            }
+                        )
+                except Exception:
+                    legal_actions_serialized = []
+
+                err_type = type(e).__name__
+                err_msg = str(e)
+                payload = {
+                    "error_type": err_type,
+                    "error_message": err_msg,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                    "run_context": {
+                        "game_id": game_id_ctx,
+                        "turn": turn_ctx,
+                        "player": player_ctx,
+                        "forced_actions_active": forced_active,
+                    },
+                    "action_context": {
+                        "selected_vec": None,
+                        "selected_source": str(kind),
+                        "legal_actions_serialized": legal_actions_serialized,
+                    },
+                    "mcts_context": None,
+                    "traceback": traceback.format_exception(type(e), e, e.__traceback__),
+                }
+                dump_path = write_debug_dump(payload)
+                print(f"[DEBUG_DUMP] wrote: {dump_path}", flush=True)
+            except Exception:
+                pass
             if os.getenv("STRICT_POLICY_ERROR") == "1":
                 # モデル使用が前提なのに失敗した場合は、環境変数で即エラー終了も選べる
                 raise
