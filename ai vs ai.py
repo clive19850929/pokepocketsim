@@ -358,20 +358,25 @@ SELFPLAY_ALPHAZERO_MODE = True の場合でも、次は「併用」できるよ�
 os.environ.setdefault("POLICY_TRACE", "1")
 
 _POLICY_BOOT_EMITTED = False
+# --- AlphaZero policy/value モデルの配置（世代ごとにここだけ変える） ---
+AZ_MODEL_DIR = r"D:\alpha_zero_models\gen000"
+AZ_MODEL_FILENAME = "selfplay_supervised_pv_gen000.pt"
+AZ_MODEL_PATH = os.path.join(AZ_MODEL_DIR, AZ_MODEL_FILENAME)
+os.environ.setdefault("AZ_MODEL_DIR", AZ_MODEL_DIR)
+os.environ.setdefault("AZ_PV_MODEL_PATH", AZ_MODEL_PATH)
+
 def _emit_policy_boot_logs_once():
     global _POLICY_BOOT_EMITTED
     if _POLICY_BOOT_EMITTED:
         return
     _POLICY_BOOT_EMITTED = True
-
     try:
-        import policy_trace_monkeypatch  # noqa
-        if os.getenv("POLICY_TRACE") == "1":
-            print("[POLICY_TRACE] enabled (policy_trace_monkeypatch loaded)")
-    except Exception as _e:
-        print("[POLICY_TRACE] import failed:", _e)
+        print("[BOOT] policy boot: starting")
+    except Exception:
+        pass
 
-    print(f"[POLICY_SPEC] P1_POLICY={P1_POLICY} P2_POLICY=...DE={SELFPLAY_ALPHAZERO_MODE} USE_MCTS_POLICY={USE_MCTS_POLICY}")
+# ★ 追加: 起動時ブートログを確実に1回だけ出す
+_emit_policy_boot_logs_once()
 
 # --- AlphaZero policy/value モデルの配置（世代ごとにここだけ変える） ---
 AZ_MODEL_DIR = r"D:\alpha_zero_models\gen000"
@@ -918,14 +923,8 @@ def _fingerprint_action_schema():
         print(f"[CHECK] schema 指紋生成エラー: {e}")
         return None, None
 
-# ★ 追加: 起動時に一度だけスキーマ指紋を計算してログに出す（未使用警告の抑止も兼ねる）
-_atp = globals().get("_action_types_path", None)
-if _atp:
-    _schema_sha, _schema_spec = _fingerprint_action_schema()
-else:
-    _schema_sha, _schema_spec = (None, {"error": "action_types_path is not set yet"})
-if _schema_sha:
-    print(f"[SYNC] action_schema_sha={_schema_sha}")
+# ★ 追加: action_schema_sha は _action_types_path 決定後に計算する（ここではまだ計算しない）
+_schema_sha, _schema_spec = (None, {"note": "deferred until _action_types_path is set"})
 
 # どこか共通ユーティリティ付近（_assert_scaler_mask の近く）に追加
 def load_or_make_scaler(path: str, obs_dim: int):
@@ -1213,6 +1212,15 @@ if not _action_types_path:
         _action_types_path = atypes_path
     else:
         raise FileNotFoundError("action_types.json が見つかりません（COLD_START=0）")
+
+# ★ 追加: _action_types_path が確定した後に action_schema_sha を計算して出力
+try:
+    _schema_sha, _schema_spec = _fingerprint_action_schema()
+except Exception:
+    _schema_sha, _schema_spec = (None, None)
+
+if _schema_sha:
+    print(f"[SYNC] action_schema_sha={_schema_sha}")
 
 # TYPE_SCHEMAS / MAX_ARGS は既存定義を使用（なければフォールバック）
 try:
@@ -2087,10 +2095,13 @@ def run_random_matches_multiprocess(to_run: int):
     writer.start()
 
     workers = []
-    import worker
     for c in chunks:
-        # 追加: mcc_agg をワーカーに渡す
-        p = Process(target=worker.play_continuous_matches_worker, args=(c, q, mcc_agg, None, _run_game_id), daemon=False)
+        # 追加: mcc_agg をワーカーに渡す（worker の引数差異に耐える互換エントリポイント経由）
+        p = Process(
+            target=_play_matches_worker_entrypoint,
+            args=(c, q, mcc_agg, None, _RUN_GAME_ID),
+            daemon=False
+        )
         p.start()
         workers.append(p)
 
@@ -2254,11 +2265,10 @@ def run_model_matches_multiprocess(to_run: int):
 
     # --- ワーカー起動（gpu_req_q が None なら CPU 経路で evaluate_q される） ---
     workers = []
-    import worker
     for c in chunks:
         p = Process(
-            target=worker.play_continuous_matches_worker,
-            args=(c, q, mcc_agg, gpu_req_q),
+            target=_play_matches_worker_entrypoint,
+            args=(c, q, mcc_agg, gpu_req_q, _RUN_GAME_ID),
             daemon=False
         )
         p.start()
@@ -2357,8 +2367,6 @@ def _is_decision_entry(e: dict) -> bool:
         and isinstance(e.get("state_after"), dict)
     )
 
-
-# ▼ これをヘルパー関数群の近く（CardNameToIdConverter の上/下どちらでもOK）に追加
 
 class CardNameToIdConverter:
     # ----------------------------------------------
@@ -2662,31 +2670,110 @@ class CardNameToIdConverter:
                 return [-1]
         else:
             return [-1]  # unknown
-    
-    def convert_legal_actions(self, legal_actions):
-        """legal_actionsのカード名をIDに変換（新形式[5ints]は素通し）"""
+
+    def convert_legal_actions(self, legal_actions, player=None):
+        """legal_actionsのカード名をIDに変換（Actionは serialize/to_id_vec を優先し、返り値は常に5-intへ正規化）"""
+        def _safe_int(x):
+            try:
+                return int(x)
+            except Exception:
+                return -1
+
+        def _to_int_list(v):
+            if v is None:
+                return None
+            if isinstance(v, tuple):
+                v = list(v)
+            if not isinstance(v, list):
+                try:
+                    v = list(v)
+                except Exception:
+                    return None
+            return [_safe_int(x) for x in v]
+
+        def _pad5(v):
+            vv = _to_int_list(v)
+            if vv is None:
+                return None
+            if len(vv) == 1 and vv[0] == -1:
+                return [-1, -1, -1, -1, -1]
+            if len(vv) < 5:
+                vv = vv + [0] * (5 - len(vv))
+            elif len(vv) > 5:
+                vv = vv[:5]
+            return vv
+
         converted_actions = []
-        for action in legal_actions:
+        for action in (legal_actions if legal_actions is not None else []):
+            # None は長さ維持のため unknown(5-int) にする（mcts_env の len チェック対策）
+            if action is None:
+                converted_actions.append([-1, -1, -1, -1, -1])
+                continue
+
+            # --- Actionオブジェクト（新形式）: to_id_vec / serialize を優先 ---
+            try:
+                fn = getattr(action, "to_id_vec", None)
+                if callable(fn):
+                    try:
+                        v = fn(player=player)
+                    except TypeError:
+                        try:
+                            v = fn(player)
+                        except Exception:
+                            v = None
+                    except Exception:
+                        v = None
+                    v5 = _pad5(v)
+                    if v5 is not None:
+                        converted_actions.append(v5)
+                        continue
+            except Exception:
+                pass
+
+            try:
+                fn = getattr(action, "serialize", None)
+                if callable(fn):
+                    try:
+                        v = fn(player=player)
+                    except TypeError:
+                        try:
+                            v = fn(player)
+                        except Exception:
+                            v = None
+                    except Exception:
+                        v = None
+                    v5 = _pad5(v)
+                    if v5 is not None:
+                        converted_actions.append(v5)
+                        continue
+            except Exception:
+                pass
+
+            # --- 旧形式（list/tuple/str/int 等） ---
             if isinstance(action, list) and len(action) > 0:
-                # 既に整数配列ならそのまま
+                # 既に整数配列ならそのまま（ただし5-intへ）
                 if all(isinstance(x, int) for x in action):
-                    converted_actions.append(action)
+                    v5 = _pad5(action)
+                    converted_actions.append(v5 if v5 is not None else [-1, -1, -1, -1, -1])
                 else:
-                    converted_actions.append(self.action_to_id(action))
+                    v5 = _pad5(self.action_to_id(action))
+                    converted_actions.append(v5 if v5 is not None else [-1, -1, -1, -1, -1])
             else:
-                # 非リスト（None / tuple / str / 単一int 等）は必ず数値配列へ正規化
-                if action is None:
-                    continue
                 if isinstance(action, tuple):
                     action = list(action)
                     if len(action) > 0 and all(isinstance(x, int) for x in action):
-                        converted_actions.append(action)
+                        v5 = _pad5(action)
+                        converted_actions.append(v5 if v5 is not None else [-1, -1, -1, -1, -1])
                     else:
-                        converted_actions.append(self.action_to_id(action))
+                        v5 = _pad5(self.action_to_id(action))
+                        converted_actions.append(v5 if v5 is not None else [-1, -1, -1, -1, -1])
                 elif isinstance(action, int):
-                    converted_actions.append([int(action)])
+                    v5 = _pad5([int(action)])
+                    converted_actions.append(v5 if v5 is not None else [-1, -1, -1, -1, -1])
                 else:
-                    converted_actions.append(self.action_to_id([action]))
+                    v5 = _pad5(self.action_to_id([action]))
+                    converted_actions.append(v5 if v5 is not None else [-1, -1, -1, -1, -1])
+
         return converted_actions
 
     def convert_legal_actions_32d(self, legal_actions, player=None):
@@ -2696,7 +2783,7 @@ class CardNameToIdConverter:
         各アクションID配列を 32 要素に pad/truncate する。
         """
         try:
-            la_ids = self.convert_legal_actions(legal_actions if legal_actions is not None else [])
+            la_ids = self.convert_legal_actions(legal_actions if legal_actions is not None else [], player=player)
         except Exception:
             la_ids = []
 
@@ -2719,7 +2806,7 @@ class CardNameToIdConverter:
                     vv.append(-1)
 
             if len(vv) < 32:
-                vv = vv + [-1] * (32 - len(vv))
+                vv = vv + [0] * (32 - len(vv))
             elif len(vv) > 32:
                 vv = vv[:32]
 
@@ -2746,7 +2833,20 @@ class CardNameToIdConverter:
             a = converted_result['action']
             if isinstance(a, list) and len(a) > 0:
                 if not all(isinstance(x, int) for x in a):
-                    converted_result['action'] = self.action_to_id(a)
+                    a = self.action_to_id(a)
+
+                # 5-int へ正規化（不足は0埋め、超過は切詰め）
+                try:
+                    a = [int(x) for x in a]
+                except Exception:
+                    a = [-1]
+                if len(a) == 1 and a[0] == -1:
+                    a = [-1, -1, -1, -1, -1]
+                elif len(a) < 5:
+                    a = a + [0] * (5 - len(a))
+                elif len(a) > 5:
+                    a = a[:5]
+                converted_result['action'] = a
 
         # ★ 追加: macro も action と同様に正規化（action が無い時は action に寄せる）
         if 'macro' in converted_result and 'action' not in converted_result:
@@ -4421,6 +4521,53 @@ def _analyze_end_reason_and_winner(path: str):
         return stats
     except Exception:
         return {}
+
+
+def _play_matches_worker_entrypoint(count, q, mcc_agg, gpu_req_q=None, run_game_id=None):
+    """
+    multiprocessing Process 用の互換エントリポイント。
+    worker.play_continuous_matches_worker のシグネチャが
+      (count, q, mcc_agg, gpu_req_q)
+    でも
+      (count, q, mcc_agg, gpu_req_q, run_game_id)
+    でも動くようにする。
+    """
+    import inspect
+    import worker
+
+    fn = getattr(worker, "play_continuous_matches_worker", None)
+    if fn is None or not callable(fn):
+        raise RuntimeError("worker.play_continuous_matches_worker is missing or not callable")
+
+    try:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+        n_pos = 0
+        has_var = False
+        for p in params:
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                n_pos += 1
+            elif p.kind == p.VAR_POSITIONAL:
+                has_var = True
+
+        args = [count, q, mcc_agg]
+
+        if has_var or n_pos >= 4:
+            args.append(gpu_req_q)
+        if has_var or n_pos >= 5:
+            args.append(run_game_id)
+
+        return fn(*args)
+    except Exception:
+        # フォールバック：5引数→4引数→3引数の順で試す
+        try:
+            return fn(count, q, mcc_agg, gpu_req_q, run_game_id)
+        except TypeError:
+            try:
+                return fn(count, q, mcc_agg, gpu_req_q)
+            except TypeError:
+                return fn(count, q, mcc_agg)
+
 
 if __name__ == "__main__":
     # --- unified gamelog header/footer (stdout/stderr tee is handled by console_tee only) ---

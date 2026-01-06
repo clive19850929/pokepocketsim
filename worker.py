@@ -92,6 +92,46 @@ def play_continuous_matches_worker(num_matches: int, queue: "Queue", mcc_agg=Non
     converter = get_converter()
     assert hasattr(converter, "convert_record")
 
+    def _wiring_where(obj) -> str:
+        try:
+            import inspect
+            if obj is None:
+                return "None"
+            if callable(obj):
+                fn = obj
+            else:
+                fn = getattr(obj, "__class__", type(obj))
+            mod = inspect.getmodule(fn)
+            file = inspect.getsourcefile(fn) or ""
+            line = 0
+            try:
+                line = int(inspect.getsourcelines(fn)[1])
+            except Exception:
+                line = 0
+            name = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
+            modn = getattr(mod, "__name__", None)
+            return f"name={name} file={file} line={line} mod={modn}"
+        except Exception:
+            try:
+                return repr(obj)
+            except Exception:
+                return "<unrepr>"
+
+    if os.getenv("AZ_DUMP_WIRING", "0") == "1":
+        try:
+            print(f"[WIRING][worker] get_converter: {_wiring_where(get_converter)}", flush=True)
+            print(f"[WIRING][worker] converter: {_wiring_where(converter)}", flush=True)
+            print(f"[WIRING][worker] converter.convert_record: {_wiring_where(getattr(converter, 'convert_record', None))}", flush=True)
+            print(f"[WIRING][worker] converter.convert_legal_actions: {_wiring_where(getattr(converter, 'convert_legal_actions', None))}", flush=True)
+            print(f"[WIRING][worker] local_policy_p1: {_wiring_where(local_policy_p1)}", flush=True)
+            print(f"[WIRING][worker] local_policy_p2: {_wiring_where(local_policy_p2)}", flush=True)
+            enc1 = getattr(local_policy_p1, "encoder", None)
+            enc2 = getattr(local_policy_p2, "encoder", None)
+            print(f"[WIRING][worker] p1.encoder: {_wiring_where(enc1)}", flush=True)
+            print(f"[WIRING][worker] p2.encoder: {_wiring_where(enc2)}", flush=True)
+        except Exception:
+            pass
+
     def _dump_policy_stats_worker(label: str, pol) -> None:
         try:
             if pol is None:

@@ -107,12 +107,62 @@ AZ_ACTION_ENCODER_PROBE_ACTION_ID = 0
 
 def encode_action_32d(action_id: int) -> list[float]:
     """
-    action_id -> 32次元ベクトル（list[float], len=32）を返す関数をここに実装してください。
-    未実装のまま動かすと policy_factory の注入直後 probe で必ず止まります（ダミーで進みません）。
+    action_id -> 32次元ベクトル（list[float], len=32）を返す関数。
+
+    注意:
+    - AlphaZeroMCTSPolicy は cand_dim!=5 の場合、legal_action_ids の各要素（= 5-int）をそのまま渡す。
+    - ここでは int / 5-int の両方を受け、最終的に 5-int に正規化して legal_actions 側へ委譲する。
     """
-    raise NotImplementedError(
-        "config.py: encode_action_32d(action_id) を実装してください（list[float] len=32 を必ず返す）"
-    )
+    # 依存は「注入済み encoder を使う」経路に統一する
+    from legal_actions import encode_action_from_vec_32d
+    import math
+
+    # action_id を 5-int に正規化
+    five = None
+    if isinstance(action_id, int):
+        try:
+            from pokepocketsim.action_space import id2vec
+        except Exception as e:
+            raise RuntimeError(
+                "encode_action_32d: failed to import pokepocketsim.action_space.id2vec "
+                f"({type(e).__name__} {e!r})"
+            )
+        five = id2vec(int(action_id))
+    elif isinstance(action_id, (list, tuple)):
+        five = list(action_id)
+    elif isinstance(action_id, dict):
+        v = action_id.get("id")
+        if isinstance(v, int):
+            try:
+                from pokepocketsim.action_space import id2vec
+            except Exception as e:
+                raise RuntimeError(
+                    "encode_action_32d: failed to import pokepocketsim.action_space.id2vec "
+                    f"({type(e).__name__} {e!r})"
+                )
+            five = id2vec(int(v))
+
+    if not isinstance(five, list):
+        raise TypeError(f"encode_action_32d: unsupported action type: {type(action_id)}")
+
+    if len(five) < 5:
+        five = five + [0] * (5 - len(five))
+    elif len(five) > 5:
+        five = five[:5]
+
+    out = encode_action_from_vec_32d(five)
+
+    if not isinstance(out, list):
+        raise TypeError(f"encode_action_32d: encoder returned non-list: {type(out)}")
+    if len(out) != 32:
+        raise RuntimeError(f"encode_action_32d: encoder returned len={len(out)} (expected 32)")
+
+    # float に強制（NaN/Inf はここで即停止）
+    out_f = [float(x) for x in out]
+    for x in out_f:
+        if not math.isfinite(x):
+            raise RuntimeError("encode_action_32d: encoder returned NaN/Inf")
+    return out_f
 
 # policy_factory 側が最優先で読む “callable 本体”
 AZ_ACTION_ENCODER_FN32 = encode_action_32d

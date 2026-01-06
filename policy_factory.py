@@ -102,12 +102,15 @@ def _resolve_action_encoder_fn32_from_config(tag: str = ""):
     """
     _fn = None
     _spec = ""
+    _fn_err = ""
+    _spec_err = ""
 
     try:
         from config import AZ_ACTION_ENCODER_FN32 as _C_FN
         _fn = _C_FN
-    except Exception:
+    except Exception as e:
         _fn = None
+        _fn_err = f"{type(e).__name__} {e!r}"
 
     if callable(_fn):
         return _fn, "ok(callable)"
@@ -115,36 +118,41 @@ def _resolve_action_encoder_fn32_from_config(tag: str = ""):
     try:
         from config import AZ_ACTION_ENCODER_FN32_SPEC as _C_SPEC
         _spec = str(_C_SPEC or "").strip()
-    except Exception:
+    except Exception as e:
         _spec = ""
+        _spec_err = f"{type(e).__name__} {e!r}"
 
     if not _spec:
-        return None, "missing both AZ_ACTION_ENCODER_FN32 (callable) and AZ_ACTION_ENCODER_FN32_SPEC ('module:function') in config.py"
+        return None, (
+            "Missing AZ_ACTION_ENCODER_FN32 (callable) and AZ_ACTION_ENCODER_FN32_SPEC('module:function') "
+            f"in config.py (callable_err={_fn_err!r}, spec_err={_spec_err!r})"
+        )
 
+    # SPEC から import
     if ":" not in _spec:
-        return None, "AZ_ACTION_ENCODER_FN32_SPEC must be 'module:function'"
+        return None, f"Invalid AZ_ACTION_ENCODER_FN32_SPEC format (expected 'module:function', got={_spec!r})"
 
     mod_name, fn_name = _spec.split(":", 1)
-    mod_name = str(mod_name or "").strip()
-    fn_name = str(fn_name or "").strip()
+    mod_name = mod_name.strip()
+    fn_name = fn_name.strip()
 
-    if not mod_name or not fn_name:
-        return None, "AZ_ACTION_ENCODER_FN32_SPEC must be 'module:function' (both non-empty)"
+    # placeholder 防止（昔のテンプレが残っていた場合）
+    if mod_name == "module" or mod_name.startswith("module."):
+        return None, (
+            "AZ_ACTION_ENCODER_FN32_SPEC uses placeholder module name 'module'. "
+            "Set a real importable module path (e.g., 'your_pkg.your_mod:your_fn'). "
+            f"(got={_spec!r})"
+        )
 
     try:
         import importlib
         mod = importlib.import_module(mod_name)
     except Exception as e:
-        return None, f"import_module failed: {type(e).__name__} {e!r}"
+        return None, f"import_module failed: {type(e).__name__} {e!r} (spec={_spec!r})"
 
-    fn = None
-    try:
-        fn = getattr(mod, fn_name, None)
-    except Exception:
-        fn = None
-
+    fn = getattr(mod, fn_name, None)
     if not callable(fn):
-        return None, f"resolved attr is not callable: module={mod_name} attr={fn_name}"
+        return None, f"resolved attr is not callable: module={mod_name} attr={fn_name} (spec={_spec!r})"
 
     return fn, "ok(spec)"
 
