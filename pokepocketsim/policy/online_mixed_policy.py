@@ -715,6 +715,28 @@ class OnlineMixedPolicy:
                 flush=True,
             )
             try:
+                event_id = None
+                try:
+                    event_id = getattr(policy, "last_step_no_match_event_id", None)
+                except Exception:
+                    event_id = None
+                if event_id is None:
+                    try:
+                        event_id = getattr(policy, "_last_step_no_match_event_id", None)
+                    except Exception:
+                        event_id = None
+                if event_id is None:
+                    try:
+                        m = getattr(player, "match", None) if player is not None else None
+                        event_id = getattr(m, "_last_step_no_match_event_id", None) if m is not None else None
+                    except Exception:
+                        event_id = None
+                if isinstance(state_dict, dict):
+                    state_dict["last_step_no_match_event_id"] = event_id
+                    state_dict["last_step_no_match_error"] = str(e)
+            except Exception:
+                pass
+            try:
                 forced_active = None
                 forced_len = None
                 turn_ctx = None
@@ -1829,6 +1851,56 @@ class OnlineMixedPolicy:
                     state_dict["online_mix_why"] = str(_why)
             except Exception:
                 pass
+
+            if str(_source) == "random" and _why is not None:
+                try:
+                    game_id = None
+                    turn = None
+                    player_name = None
+                    forced_active = None
+                    forced_len = None
+                    try:
+                        m = getattr(player, "match", None) if player is not None else None
+                        game_id = getattr(m, "game_id", None) if m is not None else None
+                        turn = getattr(m, "turn", None) if m is not None else None
+                        fa = getattr(m, "forced_actions", None) if m is not None else None
+                        if isinstance(fa, (list, tuple)):
+                            forced_len = int(len(fa))
+                            forced_active = forced_len > 0
+                    except Exception:
+                        game_id = None
+                        turn = None
+                        forced_active = None
+                        forced_len = None
+                    try:
+                        player_name = getattr(player, "name", None) if player is not None else None
+                    except Exception:
+                        player_name = None
+                    event_id = None
+                    try:
+                        if isinstance(state_dict, dict):
+                            event_id = state_dict.get("last_step_no_match_event_id", None)
+                    except Exception:
+                        event_id = None
+                    if event_id is None:
+                        try:
+                            event_id = getattr(m, "_last_step_no_match_event_id", None) if m is not None else None
+                        except Exception:
+                            event_id = None
+                    print(
+                        "[ONLINE_MIX][RANDOM_FALLBACK]"
+                        f" game_id={game_id}"
+                        f" turn={turn}"
+                        f" player={player_name}"
+                        f" forced_active={forced_active}"
+                        f" forced_len={forced_len}"
+                        f" n_actions={len(actions) if isinstance(actions, list) else 'NA'}"
+                        f" reason={_why}"
+                        f" event_id={event_id}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
 
             # ログは環境変数でON/OFF（デフォルトOFF：Player側で出す想定）
             try:

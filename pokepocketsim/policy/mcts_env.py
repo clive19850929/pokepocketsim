@@ -576,6 +576,55 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
             return v
         return v if (cur == root) else -v
 
+    def _next_la5_event_id(self) -> str:
+        import time
+        try:
+            c = int(getattr(self, "_la5_event_counter", 0) or 0) + 1
+        except Exception:
+            c = 1
+        try:
+            setattr(self, "_la5_event_counter", c)
+        except Exception:
+            pass
+        return f"la5_{int(time.time() * 1000)}_{int(c)}"
+
+    def _format_list_head_tail(self, items: Any, full: bool = False) -> str:
+        import os
+
+        def _safe_repr(x: Any, limit: int = 1200) -> str:
+            try:
+                s = repr(x)
+            except Exception:
+                try:
+                    s = f"<repr failed: {type(x).__name__}>"
+                except Exception:
+                    s = "<repr failed>"
+            if len(s) > int(limit):
+                s = s[: int(limit)] + "..."
+            return s
+
+        if not isinstance(items, list):
+            return _safe_repr(items)
+
+        mode = str(os.getenv("MCTS_ENV_LA5_LIST_MODE", "headtail")).strip().lower()
+        if full or mode == "full":
+            try:
+                return repr(items)
+            except Exception:
+                return _safe_repr(items, limit=6000)
+
+        try:
+            k = int(os.getenv("MCTS_ENV_LA5_LIST_K", "6") or "6")
+        except Exception:
+            k = 6
+
+        if k <= 0 or len(items) <= 2 * k:
+            return _safe_repr(items, limit=2400)
+
+        head = items[:k]
+        tail = items[-k:]
+        return f"{_safe_repr(head, limit=2400)}...{_safe_repr(tail, limit=2400)}(len={len(items)})"
+
     def _coerce_5int(self, vec: Any, action_obj: Any = None, player: Any = None) -> Optional[List[int]]:
         """
         vec を len=5 の int ベクトルに正規化する。
@@ -923,6 +972,55 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         except Exception:
             pass
 
+        try:
+            action_sig = []
+            for a in actions:
+                ser = _try_serialize(a)
+                action_sig.append(
+                    (
+                        type(a).__name__,
+                        getattr(a, "action_type", None),
+                        getattr(a, "name", None),
+                        _safe_repr(ser, limit=240),
+                    )
+                )
+            action_sig = tuple(action_sig)
+
+            cache_key = (
+                ctx.get("turn"),
+                ctx.get("player"),
+                ctx.get("forced_len"),
+                ctx.get("forced_player"),
+                action_sig,
+            )
+            cache = getattr(self, "_la5_convert_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(self, "_la5_convert_cache", cache)
+            prev = cache.get(cache_key)
+            if prev is None:
+                cache[cache_key] = list(out)
+            else:
+                if prev != out:
+                    try:
+                        action_types = [type(a).__name__ for a in actions]
+                    except Exception:
+                        action_types = None
+                    print(
+                        "[MCTS_ENV][LA5][CONVERT_DRIFT]"
+                        f" game_id={ctx.get('game_id')}"
+                        f" turn={ctx.get('turn')}"
+                        f" player={ctx.get('player')}"
+                        f" forced_active={ctx.get('forced_active')}"
+                        f" n_actions={len(actions) if isinstance(actions, list) else 'NA'}"
+                        f" action_types={self._format_list_head_tail(action_types, full=False)}"
+                        f" prev={self._format_list_head_tail(prev, full=True)}"
+                        f" now={self._format_list_head_tail(out, full=True)}",
+                        flush=True,
+                    )
+        except Exception:
+            pass
+
         return out
 
     def _start_turn_for_player(self, player: Player) -> None:
@@ -1147,6 +1245,42 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
             actions = player.gather_actions(self._match) or []
             ids = self._convert_legal_actions_5int(actions, player) if actions else []
 
+        try:
+            log_key = (turn, ctx.get("player"), forced_len, ctx.get("forced_player"))
+            should_log = False
+            if str(os.getenv("MCTS_ENV_LA5_CAND_LOG", "0")).strip() == "1":
+                should_log = True
+            else:
+                try:
+                    should_log = getattr(self, "_la5_cand_logged_key", None) != log_key
+                except Exception:
+                    should_log = True
+            if should_log:
+                rows = []
+                for i, a in enumerate(actions):
+                    vec = ids[i] if isinstance(ids, list) and i < len(ids) else None
+                    rows.append(
+                        {
+                            "i": i,
+                            "name": getattr(a, "name", None),
+                            "action_type": getattr(a, "action_type", None),
+                            "vec": vec,
+                        }
+                    )
+                print(
+                    "[MCTS_ENV][LA5][CAND]"
+                    f" game_id={ctx.get('game_id')}"
+                    f" turn={turn}"
+                    f" player={ctx.get('player')}"
+                    f" forced_active={ctx.get('forced_active')}"
+                    f" n_actions={len(actions) if isinstance(actions, list) else 'NA'}"
+                    f" table={self._format_list_head_tail(rows, full=False)}",
+                    flush=True,
+                )
+                setattr(self, "_la5_cand_logged_key", log_key)
+        except Exception:
+            pass
+
         lookup = {}
         dup_keys = []
         for i, vec in enumerate(ids):
@@ -1319,6 +1453,15 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
                 chosen = None
 
         if chosen is None:
+            event_id = self._next_la5_event_id()
+            try:
+                setattr(self, "_last_step_no_match_event_id", event_id)
+            except Exception:
+                pass
+            try:
+                setattr(self._match, "_last_step_no_match_event_id", event_id)
+            except Exception:
+                pass
             def _safe_repr(x: Any, limit: int = 640) -> str:
                 try:
                     s = repr(x)
@@ -1451,6 +1594,7 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
 
             dump_payload = {
                 "error_type": "action_id_mismatch",
+                "event_id": event_id,
                 "error_message": (
                     "MatchPlayerSimEnv.step: could not find the Action object for the given 5-int id "
                     "(cache+converter-based)."
@@ -1472,6 +1616,19 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
                 },
                 "debug_context": {
                     "cache_ok": cache_ok,
+                    "cache_key": {
+                        "turn": now_turn,
+                        "player": ctx.get("player"),
+                        "forced_len": forced_len_now,
+                        "forced_player": forced_player_name_now,
+                    },
+                    "cache_state": {
+                        "turn": getattr(self, "_la_cache_turn", None),
+                        "player": getattr(self, "_la_cache_player_name", None),
+                        "forced_len": getattr(self, "_la_cache_forced_len", None),
+                        "forced_player": getattr(self, "_la_cache_forced_player_name", None),
+                    },
+                    "cache_lookup_keys": list(lookup.keys()) if isinstance(lookup, dict) else None,
                     "forced_len": ctx.get("forced_len"),
                     "forced_player": ctx.get("forced_player"),
                     "ids_len": len(ids) if isinstance(ids, list) else None,
@@ -1492,6 +1649,7 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
             try:
                 print(
                     "[MCTS_ENV][LA5][STEP_NO_MATCH]"
+                    f" event_id={event_id}"
                     f" game_id={ctx.get('game_id')}"
                     f" turn={ctx.get('turn')}"
                     f" player={ctx.get('player')}"
@@ -1502,6 +1660,36 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
                     f" actions_len={len(actions) if isinstance(actions, list) else 'NA'}"
                     f" ids_len={len(ids) if isinstance(ids, list) else 'NA'}"
                     f" matched_indices={matched_indices}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+            try:
+                action_types = [type(a).__name__ for a in actions] if isinstance(actions, list) else None
+            except Exception:
+                action_types = None
+
+            try:
+                print(
+                    "[MCTS_ENV][LA5][STEP_NO_MATCH_DETAIL]"
+                    f" event_id={event_id}"
+                    f" game_id={ctx.get('game_id')}"
+                    f" turn={ctx.get('turn')}"
+                    f" player={ctx.get('player')}"
+                    f" forced_active={ctx.get('forced_active')}"
+                    f" n_actions={len(actions) if isinstance(actions, list) else 'NA'}"
+                    f" target_type={type(action).__name__}"
+                    f" target={_safe_repr(target, limit=240)}"
+                    f" ids_full={self._format_list_head_tail(ids, full=True)}"
+                    f" action_types={self._format_list_head_tail(action_types, full=True)}"
+                    f" matched_indices={matched_indices}"
+                    f" matched_by_converter={matched_by_converter}"
+                    f" cache_ok={cache_ok}"
+                    f" cache_key={{turn:{now_turn},player:{ctx.get('player')},forced_len:{forced_len_now},forced_player:{forced_player_name_now}}}"
+                    f" cache_state={{turn:{getattr(self, '_la_cache_turn', None)},player:{getattr(self, '_la_cache_player_name', None)},"
+                    f"forced_len:{getattr(self, '_la_cache_forced_len', None)},forced_player:{getattr(self, '_la_cache_forced_player_name', None)}}}"
+                    f" cache_lookup_keys={self._format_list_head_tail(list(lookup.keys()) if isinstance(lookup, dict) else None, full=True)}",
                     flush=True,
                 )
             except Exception:
