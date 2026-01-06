@@ -927,6 +927,69 @@ class AlphaZeroMCTSPolicy:
             except Exception:
                 pass
 
+        def _format_vec_list(vecs, full: bool = False) -> str:
+            import os
+
+            def _safe_repr(x, limit=2000):
+                try:
+                    s = repr(x)
+                except Exception:
+                    s = f"<repr failed: {type(x).__name__}>"
+                if len(s) > int(limit):
+                    s = s[: int(limit)] + "..."
+                return s
+
+            if not isinstance(vecs, list):
+                return _safe_repr(vecs)
+
+            mode = str(os.getenv("MCTS_ENV_LA5_LIST_MODE", "headtail")).strip().lower()
+            if full or mode == "full":
+                try:
+                    return repr(vecs)
+                except Exception:
+                    return _safe_repr(vecs, limit=6000)
+
+            try:
+                k = int(os.getenv("MCTS_ENV_LA5_LIST_K", "6") or "6")
+            except Exception:
+                k = 6
+
+            if k <= 0 or len(vecs) <= 2 * k:
+                return _safe_repr(vecs, limit=2400)
+
+            head = vecs[:k]
+            tail = vecs[-k:]
+            return f"{_safe_repr(head, limit=2400)}...{_safe_repr(tail, limit=2400)}(len={len(vecs)})"
+
+        def _get_env_ctx(_env):
+            try:
+                fn = getattr(_env, "_get_log_context", None)
+                if callable(fn):
+                    return fn()
+            except Exception:
+                pass
+            out = {}
+            try:
+                m = getattr(_env, "_match", None)
+                out["game_id"] = getattr(m, "game_id", None) if m is not None else None
+                out["turn"] = getattr(m, "turn", None) if m is not None else None
+            except Exception:
+                out["game_id"] = None
+                out["turn"] = None
+            try:
+                p = getattr(_env, "_get_current_player", None)
+                if callable(p):
+                    out["player"] = getattr(p(), "name", None)
+            except Exception:
+                out["player"] = None
+            try:
+                fa = getattr(_env, "_forced_is_active", None)
+                if callable(fa):
+                    out["forced_active"] = bool(fa())
+            except Exception:
+                out["forced_active"] = None
+            return out
+
         for sim_i in range(int(sims)):
             buf_text = None
             with _mute_stdio() as buf:
@@ -936,8 +999,10 @@ class AlphaZeroMCTSPolicy:
                     path = [root]
 
                     last_action = None
+                    depth = 0
 
                     while (not sim_env.is_terminal()) and (not node.is_leaf()):
+                        depth += 1
                         total_N = sum(c.N for c in node.children.values()) or 1
                         best_child = None
                         best_score = None
@@ -956,7 +1021,45 @@ class AlphaZeroMCTSPolicy:
                             raise RuntimeError("[AZ][MCTS] selection failed: action_from_parent is None (no fallback).")
 
                         last_action = best_child.action_from_parent
-                        sim_env.step(last_action)
+                        node_actions = []
+                        try:
+                            node_actions = [c.action_from_parent for c in node.children.values()]
+                        except Exception:
+                            node_actions = None
+                        pre_ctx = _get_env_ctx(sim_env)
+                        try:
+                            sim_env.step(last_action)
+                        except Exception as e:
+                            post_ctx = _get_env_ctx(sim_env)
+                            try:
+                                event_id = getattr(sim_env, "_last_step_no_match_event_id", None)
+                            except Exception:
+                                event_id = None
+                            try:
+                                print(
+                                    "[AZ][MCTS][STEP_FAIL]"
+                                    f" sim={int(sim_i)} depth={int(depth)}"
+                                    f" game_id={pre_ctx.get('game_id')}"
+                                    f" pre_turn={pre_ctx.get('turn')}"
+                                    f" pre_player={pre_ctx.get('player')}"
+                                    f" pre_forced={pre_ctx.get('forced_active')}"
+                                    f" post_turn={post_ctx.get('turn')}"
+                                    f" post_player={post_ctx.get('player')}"
+                                    f" post_forced={post_ctx.get('forced_active')}"
+                                    f" n_actions={len(node_actions) if isinstance(node_actions, list) else 'NA'}"
+                                    f" target={_format_vec_list(last_action, full=True)}"
+                                    f" node_actions={_format_vec_list(node_actions, full=True)}"
+                                    f" event_id={event_id}"
+                                    f" err={type(e).__name__}:{e}",
+                                    flush=True,
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                setattr(self, "last_step_no_match_event_id", event_id)
+                            except Exception:
+                                pass
+                            raise
 
                         node = best_child
                         path.append(node)
