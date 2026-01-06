@@ -296,28 +296,15 @@ class Player:
                     f"{self.opponent.name} の {self.opponent.active_card[-1].name} は気絶した！"
                 )
             # サイド取得
+            # サイド取得
             prize_to_take = 2 if self.opponent.active_card[-1].is_ex else 1
             if self.print_actions:
                 kind = "EXポケモン" if prize_to_take == 2 else "通常ポケモン"
                 self.log_print(f"{self.name} は{kind}を気絶させたのでサイドカードを{prize_to_take}枚獲得します")
             self.points += prize_to_take
-            for _ in range(prize_to_take):
-                if self.prize_cards:
-                    self.take_prize()
 
-            # --- サイド全取り勝利判定
-            if len(self.prize_cards) == 0 and self.match:
-                if self.print_actions:
-                    self.log_print(f"{self.name} はサイドを全て取り切ったので勝利です！")
-                self.match.game_over = True
-                self.match.winner = self.name
-                try:
-                    if hasattr(self, "logger") and self.logger:
-                        self.logger.log_terminal_step(reason="prize_out")
-                except Exception:
-                    pass
-                result = True
-                return result  # サイド切れならここで終了
+            # ★ forced_actions 対応：KO後のサイド取得は match 側 forced に切り替える（無ければ従来通り即時取得）
+            self._set_forced_take_prize(getattr(self, "match", None), prize_to_take)
 
             # --- 気絶したポケモンと付随カードを全てトラッシュへ ---
             if self.opponent.active_card is not None:
@@ -348,6 +335,7 @@ class Player:
                 if self.print_actions:
                     self.log_print(f"{self.opponent.name} の場から全てのポケモンがいなくなりました。{self.name} の勝利です！")
                 if self.match:
+                    setattr(self.match, "_end_reason", "bench_out_or_knockout")
                     self.match.game_over = True
                     self.match.winner = self.name
                     try:
@@ -360,7 +348,6 @@ class Player:
                 # ベンチから昇格（人間は選択、AIはランダム/今後強化学習へ拡張可）
                 self.opponent.promote_from_bench()
         return result
-
 
     def promote_from_bench(self):
         """
@@ -390,13 +377,15 @@ class Player:
         else:
             # AI（現状はランダム、将来強化学習可）
             # 学習済みAIならここにポリシー/モデルによる選択ロジック
-            choice = random.randrange(len(self.bench))
+            if bool(getattr(getattr(self, "match", None), "_is_mcts_simulation", False)):
+                choice = 0
+            else:
+                choice = random.randrange(len(self.bench))
             promoted = self.bench.pop(choice)
         self.active_card = promoted
         if hasattr(self, "log_print"):
             self.log_print(f"{self.name} はベンチから {promoted[-1].name} をバトル場に出しました。")
         return promoted
-
 
     def print_state_after(self, turn=None):
         return self.logger.print_state_after(turn=turn)
@@ -1069,32 +1058,124 @@ class Player:
         """残りサイド枚数を返す"""
         return len(self.prize_cards)
         # サイドを取ったときに 1 枚減らすメソッド例
-    def take_prize(self) -> None:
+
+    def _build_take_prize_actions(self) -> List["Action"]:
+        acts: List["Action"] = []
+        # ActionType.TAKE_PRIZE が未実装なら空（呼び出し側でフォールバックする）
+        if not hasattr(ActionType, "TAKE_PRIZE"):
+            return acts
+
+        for i in range(len(self.prize_cards)):
+            a = Action(
+                f"[サイド取得] サイドカード{i + 1}番目を取る",
+                lambda player=self, idx=i: player.take_prize(forced_idx=idx),
+                ActionType.TAKE_PRIZE,
+                can_continue_turn=True,
+            )
+            # serialize 側で使うなら自由に（必須でなければ無くてもOK）
+            a.extra = {"selected_prize_idx": i + 1}
+            acts.append(a)
+
+        return acts
+
+    def _set_forced_take_prize(self, match: "Match", count: int) -> None:
+        """
+        KO後のサイド取得を forced_actions に切り替える。
+        TAKE_PRIZE が無い場合は従来通り即時取得へフォールバック。
+        """
+        m = match if match is not None else getattr(self, "match", None)
+
+        if m is None or (not hasattr(ActionType, "TAKE_PRIZE")):
+            for _ in range(int(count or 0)):
+                if self.prize_cards:
+                    self.take_prize()
+            return
+
+        try:
+            setattr(m, "forced_player", self)
+        except Exception:
+            pass
+
+        try:
+            setattr(m, "forced_prize_remaining", int(count or 0))
+        except Exception:
+            pass
+
+        m.forced_actions = self._build_take_prize_actions()
+
+    def take_prize(self, forced_idx: Optional[int] = None) -> None:
         if not self.prize_cards:
             raise ValueError("既にサイドが残っていません")
-        if self.is_bot:
-            idx = random.randint(0, len(self.prize_cards) - 1)
-            # AI同士の対戦時はサイドカード選択の詳細を表示
-            if self.print_actions:
-                self.log_print(f"{self.name} はサイドカード{idx + 1}番目をランダム選択しました")
+
+        if forced_idx is not None:
+            try:
+                idx = int(forced_idx)
+            except Exception:
+                idx = 0
+            if idx < 0 or idx >= len(self.prize_cards):
+                idx = 0
         else:
-            print("サイドカードを選んでください:")
-            for i in range(1, len(self.prize_cards) + 1):
-                print(f"{i}: [裏向き]")
-            while True:
-                try:
-                    idx = int(input("番号: ")) - 1
-                    if 0 <= idx < len(self.prize_cards):
-                        break
-                except Exception:
-                    pass
-                print("無効な入力です。")
+            if self.is_bot:
+                if bool(getattr(getattr(self, "match", None), "_is_mcts_simulation", False)):
+                    idx = 0
+                    if self.print_actions:
+                        self.log_print(f"{self.name} はサイドカード{idx + 1}番目を固定選択しました（MCTSシミュレーション）")
+                else:
+                    idx = random.randint(0, len(self.prize_cards) - 1)
+                    # AI同士の対戦時はサイドカード選択の詳細を表示
+                    if self.print_actions:
+                        self.log_print(f"{self.name} はサイドカード{idx + 1}番目をランダム選択しました")
+            else:
+                print("サイドカードを選んでください:")
+                for i in range(1, len(self.prize_cards) + 1):
+                    print(f"{i}: [裏向き]")
+                while True:
+                    try:
+                        idx = int(input("番号: ")) - 1
+                        if 0 <= idx < len(self.prize_cards):
+                            break
+                    except Exception:
+                        pass
+                    print("無効な入力です。")
+
         card = self.prize_cards.pop(idx)
         self.hand.append(card)
         self.log_print(f"サイドカードとして「{card}」を手札に加えました")
         # 残りサイド枚数を表示
         if self.print_actions:
             self.log_print(f"{self.name} の残りサイド枚数: {len(self.prize_cards)}枚")
+
+        # forced_prize_remaining がある場合は decrement & 次の候補を更新/クリア
+        try:
+            m = getattr(self, "match", None)
+            if m is not None and hasattr(m, "forced_prize_remaining"):
+                rem = int(getattr(m, "forced_prize_remaining", 0) or 0)
+                if rem > 0:
+                    rem -= 1
+                    setattr(m, "forced_prize_remaining", rem)
+                    if rem > 0 and self.prize_cards:
+                        m.forced_actions = self._build_take_prize_actions()
+                    else:
+                        m.forced_actions = []
+                        try:
+                            setattr(m, "forced_player", None)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # --- サイド全取り勝利判定（TAKE_PRIZE 実行時に確定） ---
+        if len(self.prize_cards) == 0 and self.match:
+            if self.print_actions:
+                self.log_print(f"{self.name} はサイドを全て取り切ったので勝利です！")
+            setattr(self.match, "_end_reason", "prize_out")
+            self.match.game_over = True
+            self.match.winner = self.name
+            try:
+                if hasattr(self, "logger") and self.logger:
+                    self.logger.log_terminal_step(reason="prize_out")
+            except Exception:
+                pass
 
     @staticmethod
     def remove_card_from_hand(player: "Player", card_id: uuid.UUID) -> None:
@@ -1107,6 +1188,15 @@ class Player:
         # ★ 追加：終局ガード（最優先で返す）
         if self.match and getattr(self.match, 'game_over', False):
             return []
+
+        # ★ 追加：forced_actions が有効なら、それだけを返す（KO後サイド取得など）
+        try:
+            if match is not None and getattr(match, "forced_player", None) is self:
+                fa = getattr(match, "forced_actions", None)
+                if isinstance(fa, list) and fa:
+                    return fa
+        except Exception:
+            pass
 
         # --- enum/id 正規化ヘルパ（Enum/tuple値/名前→常に int に揃える）---
         def _as_card_id(enum_or_int, name_fallback=None) -> int:
@@ -2263,8 +2353,7 @@ class Player:
             "game_id": getattr(m, "game_id", None),
         }
 
-
-# --- 手札を山札の下へ戻してシャッフル ---
+    # --- 手札を山札の下へ戻してシャッフル ---
     def move_hand_to_deck_bottom_and_shuffle(self) -> None:
         # 手札のカードをすべて山札末尾へ
         # hand は List[Card]、deck.cards は List[Card] を想定
@@ -2303,9 +2392,11 @@ class Player:
         energy_n = len(getattr(card, "attached_energies", []) or [])
         stage_bonus = 15 if not getattr(card, "is_basic", False) else 0
         # 大物(=EX)・育ってる(=エネ多い/進化)を優先し、残りHPが低いほど優先
-        # タイブレーク用の微小ノイズを足す
+        # タイブレーク用の微小ノイズを足す（MCTSシミュレーション中は決定論にする）
         import random
-        return (is_ex * 200) + (energy_n * 12) + stage_bonus - hp + random.random() * 0.01
+        m = getattr(self, "match", None)
+        noise = 0.0 if bool(getattr(m, "_is_mcts_simulation", False)) else (random.random() * 0.01)
+        return (is_ex * 200) + (energy_n * 12) + stage_bonus - hp + noise
 
     # --- ベンチインデックス選択（ポリシーフック→既定ヒューリスティック）---
     def _select_opponent_bench_index(self, stacks: List[List["Card"]]) -> int:

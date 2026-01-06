@@ -45,6 +45,10 @@ class Match:
         self.turn: int = 0
         self.game_over: bool = False
 
+        self.forced_actions = []
+        self.forced_player = None
+        self.forced_prize_remaining = 0
+
 
         def _enum_from_card(obj):
             try:
@@ -66,7 +70,7 @@ class Match:
                 if not hasattr(p, "initial_deck_enums") or not p.initial_deck_enums:
                     lst = []
                     for c in getattr(p.deck, "cards", []) or []:
-                        obj = c[-1] if isinstance(c, list) and c else c
+                        obj = c[-1] if isinstance(c, (list, tuple)) and c else c
                         lst.append(_enum_from_card(obj))
                     p.initial_deck_enums = lst[:]  # ここでは山札のみ。必要に応じて配布直後に上書き
             except Exception:
@@ -929,7 +933,7 @@ class Match:
                             self.log_print(f"{draw_player.name} はカードを1枚引きました: {getattr(card, 'name', str(card))}")
                         else:
                             self.log_print(f"{draw_player.name} はカードを1枚引きました。")
-                        from pokepocketsim.card import Card
+                        from .card import Card
                         if isinstance(card, Card) and getattr(card, 'is_basic', False):
                             if not draw_player.is_bot:
                                 ans = input(f"引いた {card.name} をベンチに出しますか？ (y/n): ")
@@ -949,7 +953,16 @@ class Match:
 
             self.show_setup_status()
             while not self.game_over:
-                active_player = self.starting_player if self.turn % 2 == 0 else self.second_player
+                forced_active = False
+                try:
+                    forced_active = bool(getattr(self, "forced_actions", None)) and (getattr(self, "forced_player", None) is not None)
+                except Exception:
+                    forced_active = False
+
+                if forced_active:
+                    active_player = getattr(self, "forced_player", None)
+                else:
+                    active_player = self.starting_player if self.turn % 2 == 0 else self.second_player
                 try:
                     self._active_player_for_log = active_player
                 except Exception:
@@ -1017,7 +1030,8 @@ class Match:
                         pass
 
 
-                active_player.setup_turn(self, viewing_player=viewing_player)
+                if not forced_active:
+                    active_player.setup_turn(self, viewing_player=viewing_player)
 
                 ret = active_player.start_turn(self, viewing_player=viewing_player)
 
@@ -1142,7 +1156,14 @@ class Match:
                     except Exception:
                         pass
 
-                self.turn += 1
+                forced_active = False
+                try:
+                    forced_active = bool(getattr(self, "forced_actions", None)) and (getattr(self, "forced_player", None) is not None)
+                except Exception:
+                    forced_active = False
+
+                if not forced_active:
+                    self.turn += 1
 
         finally:
             try:
@@ -1283,7 +1304,16 @@ class Match:
     # === 追加: UI向けの公開状態を構築して返す（選択UI・スナップショット用） ===
     def build_public_state_for_ui(self, viewer: "Player") -> Dict[str, Any]:
         # いまの手番プレイヤー名
-        current_player = self.starting_player if (self.turn % 2 == 0) else self.second_player
+        forced_active = False
+        try:
+            forced_active = bool(getattr(self, "forced_actions", None)) and (getattr(self, "forced_player", None) is not None)
+        except Exception:
+            forced_active = False
+
+        if forced_active:
+            current_player = getattr(self, "forced_player", None)
+        else:
+            current_player = self.starting_player if (self.turn % 2 == 0) else self.second_player
         current_name = getattr(current_player, "name", None)
 
         def _active_dict(p: "Player"):
@@ -1359,9 +1389,23 @@ class Match:
             snap = None
             lg = getattr(viewer, "logger", None)
             if lg is not None and hasattr(lg, "build_state_snapshot"):
-                try:
-                    snap = lg.build_state_snapshot()
-                except Exception:
+                # 再入防止: build_state_snapshot が内部で match.build_public_state_for_ui を呼ぶ場合がある
+                if not getattr(self, "_in_build_state_snapshot", False):
+                    try:
+                        setattr(self, "_in_build_state_snapshot", True)
+                        try:
+                            snap = lg.build_state_snapshot()
+                        finally:
+                            try:
+                                delattr(self, "_in_build_state_snapshot")
+                            except Exception:
+                                try:
+                                    setattr(self, "_in_build_state_snapshot", False)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        snap = None
+                else:
                     snap = None
 
             if isinstance(snap, dict):
@@ -1456,6 +1500,23 @@ class Match:
         }
 
 # === UI表示用ヘルパー（0:ポケモン,1:グッズ,2:サポ,3:どうぐ,4:スタジアム,5:その他,6:エネルギー） ===
+def _ui_enum(obj):
+    try:
+        if isinstance(obj, (list, tuple)) and obj:
+            obj = obj[-1]
+        enum_ = getattr(obj, "card_enum", None)
+        if isinstance(enum_, int):
+            return enum_
+        if hasattr(enum_, "value"):
+            v = enum_.value
+            if isinstance(v, (tuple, list)) and v:
+                return int(v[0])
+            if isinstance(v, int):
+                return v
+        return int(getattr(obj, "id", 0)) or 0
+    except Exception:
+        return 0
+
 def _ui_cat(card):
     try:
         if getattr(card, "hp", None) is not None or getattr(card, "is_pokemon", False): return 0
@@ -1472,7 +1533,7 @@ def _ui_cat(card):
 def _ui_obj(card):
     nm = getattr(card, "name", str(card))
     cat = _ui_cat(card)
-    d = {"name": nm, "cat": cat}
+    d = {"name": nm, "cat": cat, "enum": _ui_enum(card)}
     # 互換性のため is_* も付与（プレゼン側のヒューリスティクスに効く）
     if cat == 0: d["is_pokemon"]   = True
     if cat == 1: d["is_item"]      = True
@@ -1495,6 +1556,7 @@ def _card_public_dict(card_top):
                 energies.append(nm)
         return {
             "name": getattr(card_top, "name", str(card_top)),
+            "enum": _ui_enum(card_top),
             "hp": getattr(card_top, "hp", None),
             "energies": energies,
             "tools": tools,
