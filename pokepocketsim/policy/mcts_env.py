@@ -62,6 +62,8 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         self._la_cache_lookup = None
         self._la_cache_forced_len = None
         self._la_cache_forced_player_name = None
+        self._la_cache_state_fingerprint = None
+        self._validate_roundtrip_running = False
 
     def clone(self) -> MCTSSimEnvProtocol:
         """
@@ -1173,6 +1175,59 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
 
         return out
 
+    def _get_state_fingerprint(self, player: Player) -> Optional[str]:
+        """
+        現在局面を識別するための軽量 fingerprint を返す。
+        可能なら player のスナップショット（private 含む）から安定ハッシュを作る。
+        """
+        m = self._match
+        sd = None
+        try:
+            fn = getattr(player, "_build_state_snapshot", None)
+            if callable(fn):
+                sd = fn()
+        except Exception:
+            sd = None
+        if sd is None:
+            try:
+                lg = getattr(player, "logger", None)
+                fn = getattr(lg, "build_state_snapshot", None) if lg is not None else None
+                if callable(fn):
+                    sd = fn()
+            except Exception:
+                sd = None
+        if sd is None:
+            if not hasattr(m, "build_public_state_for_ui"):
+                return None
+            try:
+                sd = m.build_public_state_for_ui(viewer=player)
+            except Exception:
+                return None
+
+        if not isinstance(sd, dict):
+            return None
+
+        sd_copy = dict(sd)
+        try:
+            sd_copy.pop("obs_vec", None)
+            sd_copy.pop("full_obs_vec", None)
+        except Exception:
+            pass
+
+        try:
+            import json
+            import hashlib
+
+            payload = json.dumps(sd_copy, sort_keys=True, ensure_ascii=False, default=str)
+            return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+        except Exception:
+            try:
+                import hashlib
+
+                return hashlib.sha1(repr(sd_copy).encode("utf-8")).hexdigest()
+            except Exception:
+                return None
+
     def _refresh_action_cache(self, player: Player) -> None:
         """
         現在状態の合法手を列挙し、5-int と Action の対応表をキャッシュする。
@@ -1321,6 +1376,7 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         self._la_cache_lookup = lookup
         self._la_cache_forced_len = forced_len
         self._la_cache_forced_player_name = getattr(self._get_forced_player(), "name", None) if forced_active else None
+        self._la_cache_state_fingerprint = self._get_state_fingerprint(player)
 
     def legal_actions(self) -> List[Any]:
         """
@@ -1328,9 +1384,56 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
 
         forced_actions がある場合は forced_actions を優先し、forced 中は turn を進めない前提で返す。
         """
+        import os
+
         cur = self._get_current_player()
 
-        self._refresh_action_cache(cur)
+        now_turn = None
+        try:
+            now_turn = int(getattr(self._match, "turn", 0) or 0)
+        except Exception:
+            now_turn = None
+
+        forced_len_now = None
+        try:
+            fr = self._get_forced_actions_raw()
+            if isinstance(fr, (list, tuple)):
+                forced_len_now = int(len(fr))
+        except Exception:
+            forced_len_now = None
+
+        forced_player_name_now = getattr(self._get_forced_player(), "name", None) if self._forced_is_active() else None
+        state_fingerprint_now = self._get_state_fingerprint(cur)
+        if state_fingerprint_now is None:
+            cache_ok = False
+        else:
+            cache_ok = False
+            try:
+                cache_ok = (
+                    getattr(self, "_la_cache_turn", None) == now_turn
+                    and getattr(self, "_la_cache_player_name", None) == getattr(cur, "name", None)
+                    and isinstance(getattr(self, "_la_cache_lookup", None), dict)
+                    and getattr(self, "_la_cache_forced_len", None) == forced_len_now
+                    and getattr(self, "_la_cache_forced_player_name", None) == forced_player_name_now
+                    and getattr(self, "_la_cache_state_fingerprint", None) == state_fingerprint_now
+                )
+            except Exception:
+                cache_ok = False
+
+        if not cache_ok:
+            self._refresh_action_cache(cur)
+            try:
+                if (
+                    os.getenv("MCTS_ENV_VALIDATE_ROUNDTRIP", "0") == "1"
+                    and not getattr(self, "_validate_roundtrip_running", False)
+                ):
+                    self._validate_roundtrip_running = True
+                    try:
+                        self.debug_validate_action_roundtrip_and_fingerprint()
+                    finally:
+                        self._validate_roundtrip_running = False
+            except Exception:
+                raise
 
         try:
             ids = getattr(self, "_la_cache_ids", None)
@@ -1360,6 +1463,72 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         # 元環境を汚さないために clone() で step を確認する
         clone_env = self.clone()
         clone_env.step(ids_first[0])
+
+    def debug_validate_action_roundtrip_and_fingerprint(self) -> None:
+        """
+        最小自己検証（fingerprint 含む）:
+        - legal_actions が返した vec は同一局面で step により必ず復元できる
+        - legal_actions が変わるなら fingerprint も変わる
+        """
+        import os
+
+        if getattr(self, "_validate_roundtrip_running", False):
+            raise RuntimeError("MatchPlayerSimEnv.debug_validate_action_roundtrip_and_fingerprint: re-entrant validation blocked.")
+
+        self._validate_roundtrip_running = True
+        try:
+            env = self.clone()
+            try:
+                env._validate_roundtrip_running = True
+            except Exception:
+                pass
+            ids_before = list(env.legal_actions())
+            cur_before = env._get_current_player()
+            fp_before = env._get_state_fingerprint(cur_before)
+            fp_before_2 = env._get_state_fingerprint(cur_before)
+            if fp_before != fp_before_2:
+                raise RuntimeError(
+                    "MatchPlayerSimEnv.debug_validate_action_roundtrip_and_fingerprint: "
+                    "fingerprint is unstable within the same state."
+                )
+
+            ids_sample = ids_before
+            try:
+                k = int(os.getenv("MCTS_ENV_VALIDATE_ROUNDTRIP_K", "") or "0")
+                if k > 0:
+                    ids_sample = ids_before[:k]
+            except Exception:
+                ids_sample = ids_before
+
+            for v in ids_sample:
+                step_env = env.clone()
+                try:
+                    step_env._validate_roundtrip_running = True
+                except Exception:
+                    pass
+                step_env.step(v)
+
+            if not ids_before:
+                return
+
+            env_after = env.clone()
+            try:
+                env_after._validate_roundtrip_running = True
+            except Exception:
+                pass
+            env_after.step(ids_before[0])
+            ids_after = list(env_after.legal_actions())
+            cur_after = env_after._get_current_player()
+            fp_after = env_after._get_state_fingerprint(cur_after)
+
+            if ids_after != ids_before:
+                if fp_before == fp_after:
+                    raise RuntimeError(
+                        "MatchPlayerSimEnv.debug_validate_action_roundtrip_and_fingerprint: "
+                        "legal_actions changed but fingerprint did not."
+                    )
+        finally:
+            self._validate_roundtrip_running = False
 
     def step(self, action: Any) -> None:
         """
@@ -1398,18 +1567,22 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
             forced_len_now = None
 
         forced_player_name_now = getattr(self._get_forced_player(), "name", None) if forced_before else None
-
-        cache_ok = False
-        try:
-            cache_ok = (
-                getattr(self, "_la_cache_turn", None) == now_turn
-                and getattr(self, "_la_cache_player_name", None) == getattr(cur, "name", None)
-                and isinstance(getattr(self, "_la_cache_lookup", None), dict)
-                and getattr(self, "_la_cache_forced_len", None) == forced_len_now
-                and getattr(self, "_la_cache_forced_player_name", None) == forced_player_name_now
-            )
-        except Exception:
+        state_fingerprint_now = self._get_state_fingerprint(cur)
+        if state_fingerprint_now is None:
             cache_ok = False
+        else:
+            cache_ok = False
+            try:
+                cache_ok = (
+                    getattr(self, "_la_cache_turn", None) == now_turn
+                    and getattr(self, "_la_cache_player_name", None) == getattr(cur, "name", None)
+                    and isinstance(getattr(self, "_la_cache_lookup", None), dict)
+                    and getattr(self, "_la_cache_forced_len", None) == forced_len_now
+                    and getattr(self, "_la_cache_forced_player_name", None) == forced_player_name_now
+                    and getattr(self, "_la_cache_state_fingerprint", None) == state_fingerprint_now
+                )
+            except Exception:
+                cache_ok = False
 
         if not cache_ok:
             self._refresh_action_cache(cur)
@@ -1712,6 +1885,7 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
             self._la_cache_lookup = None
             self._la_cache_forced_len = None
             self._la_cache_forced_player_name = None
+            self._la_cache_state_fingerprint = None
         except Exception:
             pass
 
