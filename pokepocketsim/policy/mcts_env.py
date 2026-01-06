@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Optional
 
 from ..match import Match
 from ..player import Player
@@ -17,18 +17,19 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         deepcopy が壊れやすい IO / logger などは memo 固定で共有し、診断ログも出せる。
         さらに、clone 後はログ出力や学習系の副作用を抑えるためのフラグ/属性を無効化する。
     - legal_actions():
-        現在の手番プレイヤーの gather_actions(match) を呼び、各 Action を serialize(player) で ID 化して返す。
-        （MCTS 内の key 比較を安定化するため、list は tuple 化する）
+        現在の手番プレイヤーの gather_actions(match) を呼び、match.converter.convert_legal_actions(...) により
+        “5-int ID” を生成して返す（MCTS の唯一の正）。
     - step(action):
-        現在の合法手を再列挙し、serialize(player) が一致する Action を特定して act_and_regather_actions で 1 手進める。
+        legal_actions() と同じ変換規則（match.converter.convert_legal_actions）で 5-int を再生成し、
+        渡された 5-int と一致する index の Action を選んで act_and_regather_actions で 1 手進める。
     - is_terminal():
         match.game_over を参照して終局判定を行う。
     - result():
         match.winner とルートプレイヤー名から +1 / -1 / 0 を返す（非終局では例外）。
 
-    注意:
-    - deepcopy ベースの clone は重くなり得るため、MCTS を有効化する場合は性能・副作用の検証が必要。
-    - clone() はログ抑制や一部フラグ無効化を行うが、完全な副作用ゼロを保証するものではない。
+    重要:
+    - 変換不能/不整合（obs_vec 生成不能、action decode不能、手番不整合、モデル入力不整合など）は
+      一切フォールバックせず RuntimeError で停止する。
     """
 
     def __init__(self, match: Match, player: Player) -> None:
@@ -52,6 +53,15 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
                 self._root_player_slot = "second_player"
         except Exception:
             self._root_player_slot = None
+
+        # legal_actions()/step() 間の 5-int ⇄ Action 対応を安定化するキャッシュ
+        self._la_cache_turn = None
+        self._la_cache_player_name = None
+        self._la_cache_actions = None
+        self._la_cache_ids = None
+        self._la_cache_lookup = None
+        self._la_cache_forced_len = None
+        self._la_cache_forced_player_name = None
 
     def clone(self) -> MCTSSimEnvProtocol:
         """
@@ -384,93 +394,1026 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
 
         return MatchPlayerSimEnv(match_copy, player_copy)
 
-    def legal_actions(self) -> List[Any]:
-        """
-        現在手番プレイヤーにとっての合法手 ID リストを返す。
 
-        実装:
-        - Player.gather_actions(match) で Action 群を取得
-        - 各 Action を serialize(self._player) で ID 化
-        - MCTS 内部の比較/辞書キーに使いやすいよう、list は tuple に正規化して返す
-        """
-        actions = self._player.gather_actions(self._match)
-        if not actions:
-            return []
-
-        legal_ids: List[Any] = []
-        for a in actions:
+    def _get_forced_actions_raw(self) -> Optional[Any]:
+        m = self._match
+        for nm in ("forced_actions", "_forced_actions", "forced_action_list", "forced_queue"):
             try:
-                vec = a.serialize(self._player)
+                v = getattr(m, nm, None)
             except Exception:
-                # シリアライズに失敗したアクションは MCTS からは扱えないため除外する。
-                continue
+                v = None
+            if v is not None:
+                return v
+        return None
 
-            # ★ MCTS 内部で hash/key 比較に使えるよう tuple 正規化
-            if isinstance(vec, list):
+    def _forced_is_active(self) -> bool:
+        fa = self._get_forced_actions_raw()
+        if fa is None:
+            return False
+        try:
+            if isinstance(fa, (list, tuple)):
+                return len(fa) > 0
+        except Exception:
+            return False
+        try:
+            return bool(fa)
+        except Exception:
+            return False
+
+    def _resolve_player_ref(self, ref: Any) -> Optional[Player]:
+        m = self._match
+        if ref is None:
+            return None
+        try:
+            if isinstance(ref, Player):
+                return ref
+        except Exception:
+            pass
+
+        p1 = getattr(m, "starting_player", None)
+        p2 = getattr(m, "second_player", None)
+
+        try:
+            if ref is p1 or ref is p2:
+                return ref
+        except Exception:
+            pass
+
+        try:
+            if isinstance(ref, str):
+                if p1 is not None and getattr(p1, "name", None) == ref:
+                    return p1
+                if p2 is not None and getattr(p2, "name", None) == ref:
+                    return p2
+        except Exception:
+            pass
+
+        try:
+            if isinstance(ref, int):
+                if int(ref) == 0:
+                    return p1
+                if int(ref) == 1:
+                    return p2
+        except Exception:
+            pass
+
+        return None
+
+    def _get_forced_player(self) -> Optional[Player]:
+        m = self._match
+
+        for nm in ("forced_player", "_forced_player", "forced_player_obj"):
+            try:
+                ref = getattr(m, nm, None)
+            except Exception:
+                ref = None
+            p = self._resolve_player_ref(ref)
+            if p is not None:
+                return p
+
+        for nm in ("forced_player_name", "_forced_player_name", "forced_owner_name", "forced_side_name"):
+            try:
+                ref = getattr(m, nm, None)
+            except Exception:
+                ref = None
+            p = self._resolve_player_ref(ref)
+            if p is not None:
+                return p
+
+        for nm in ("forced_player_slot", "_forced_player_slot"):
+            try:
+                slot = getattr(m, nm, None)
+            except Exception:
+                slot = None
+            if slot in ("starting_player", "second_player"):
                 try:
-                    vec = tuple(vec)
+                    return getattr(m, slot, None)
                 except Exception:
                     pass
 
-            legal_ids.append(vec)
+        return None
 
-        return legal_ids
-
-    def step(self, action: Any) -> None:
+    def _get_current_player(self) -> Player:
         """
-        指定された action を 1 手適用して内部状態を進める。
+        Match.play と同じ規則で「現在手番プレイヤー」を返す。
 
-        ここでの action は legal_actions() が返した ID ベクトルの 1 要素を想定する。
-        現在の合法手を gather_actions で再列挙し、serialize(self._player) の結果が
-        action と一致する Action を特定して act_and_regather_actions を用いて実行する。
+        forced_actions が有効な間は forced 側プレイヤーを優先する（turn は進めない）。
         """
-        actions = self._player.gather_actions(self._match)
-        if not actions:
-            return
+        m = self._match
 
-        # ★ list/tuple の表現差で一致判定が落ちないよう正規化
-        action_key = action
-        if isinstance(action, list):
+        if self._forced_is_active():
+            fp = self._get_forced_player()
+            if fp is not None:
+                return fp
+
+        try:
+            t = int(getattr(m, "turn", 0) or 0)
+        except Exception:
+            t = 0
+
+        p = getattr(m, "starting_player", None) if (t % 2 == 0) else getattr(m, "second_player", None)
+        if p is None:
+            raise RuntimeError("MatchPlayerSimEnv: match.starting_player/second_player is missing.")
+        return p
+
+    def root_player_name(self) -> Optional[str]:
+        return self._root_player_name
+
+    def current_player_name(self) -> Optional[str]:
+        try:
+            return getattr(self._get_current_player(), "name", None)
+        except Exception:
+            return None
+
+    def value_to_root(self, value_current_player: float) -> float:
+        """
+        モデルが「現在手番プレイヤー視点」の value を返す前提で、
+        ルート（root player）視点に変換して返す。
+        """
+        try:
+            v = float(value_current_player)
+        except Exception:
+            v = 0.0
+
+        root = self._root_player_name
+        cur = self.current_player_name()
+        if root is None or cur is None:
+            return v
+        return v if (cur == root) else -v
+
+    def _coerce_5int(self, vec: Any, action_obj: Any = None, player: Any = None) -> Optional[List[int]]:
+        """
+        vec を len=5 の int ベクトルに正規化する。
+        - list/tuple/np.ndarray などを許容
+        - Enum/tuple 値なども int に揃える
+        """
+        if vec is None:
+            return None
+
+        def _safe_repr(x: Any, limit: int = 480) -> str:
             try:
-                action_key = tuple(action)
+                s = repr(x)
+            except Exception:
+                try:
+                    s = f"<repr failed: {type(x).__name__}>"
+                except Exception:
+                    s = "<repr failed>"
+            if len(s) > int(limit):
+                s = s[: int(limit)] + "..."
+            return s
+
+        def _action_brief(a: Any) -> str:
+            if a is None:
+                return "None"
+            try:
+                parts = [f"type={type(a).__name__}"]
+                try:
+                    nm = getattr(a, "name", None)
+                    if nm is not None:
+                        parts.append(f"name={nm}")
+                except Exception:
+                    pass
+                try:
+                    at = getattr(a, "action_type", None)
+                    if at is not None:
+                        parts.append(f"action_type={at}")
+                except Exception:
+                    pass
+                return " ".join(parts)
+            except Exception:
+                return _safe_repr(a)
+
+        # numpy
+        try:
+            import numpy as np  # noqa: F401
+        except Exception:
+            np = None
+
+        if np is not None:
+            try:
+                if isinstance(vec, np.ndarray):
+                    vec = vec.reshape(-1).tolist()
             except Exception:
                 pass
 
-        selected_action = None
-        for a in actions:
-            try:
-                vec = a.serialize(self._player)
-            except Exception:
-                continue
+        if isinstance(vec, tuple):
+            vec = list(vec)
 
-            vec_key = vec
-            if isinstance(vec, list):
+        if not isinstance(vec, list) or len(vec) != 5:
+            try:
+                print(
+                    "[MCTS_ENV][COERCE_5INT_FAIL] reason=not_list_or_len_mismatch"
+                    f" player={getattr(player, 'name', None) if player is not None else None}"
+                    f" vec_type={type(vec).__name__ if vec is not None else None}"
+                    f" vec_len={len(vec) if isinstance(vec, (list, tuple)) else None}"
+                    f" vec={_safe_repr(vec)}"
+                    f" action={_action_brief(action_obj)}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return None
+
+        out: List[int] = []
+        for x in vec:
+            try:
+                if isinstance(x, int):
+                    out.append(int(x))
+                    continue
+                if hasattr(x, "value"):
+                    xv = getattr(x, "value")
+                    if isinstance(xv, int):
+                        out.append(int(xv))
+                        continue
+                    if isinstance(xv, (tuple, list)) and len(xv) > 0 and isinstance(xv[0], int):
+                        out.append(int(xv[0]))
+                        continue
+                # それ以外は int 変換を試す
+                out.append(int(x))
+            except Exception as e:
                 try:
-                    vec_key = tuple(vec)
+                    print(
+                        "[MCTS_ENV][COERCE_5INT_FAIL] reason=int_cast_failed"
+                        f" player={getattr(player, 'name', None) if player is not None else None}"
+                        f" x_type={type(x).__name__ if x is not None else None}"
+                        f" x={_safe_repr(x)}"
+                        f" vec={_safe_repr(vec)}"
+                        f" action={_action_brief(action_obj)}"
+                        f" exc={type(e).__name__}:{e}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                return None
+
+        return out
+
+    def _convert_legal_actions_5int(self, actions: List[Any], player: Player) -> List[List[int]]:
+        """
+        match.converter.convert_legal_actions(actions, player=...) を唯一の正として 5-int を生成する。
+        失敗/不整合は RuntimeError で停止（フォールバック禁止）。
+
+        A: converter が受け取っている actions の実体（要素の型/形）を、失敗時に必ずダンプする
+        B: convert_legal_actions の返り値 ids（5-int になっているか）を、失敗時に必ずダンプする
+        """
+        m = self._match
+        conv = getattr(m, "converter", None)
+        if conv is None or not hasattr(conv, "convert_legal_actions"):
+            raise RuntimeError("MatchPlayerSimEnv: _actions is missing (cannot build 5-int ids).")
+
+        def _safe_repr(x: Any, limit: int = 480) -> str:
+            try:
+                s = repr(x)
+            except Exception:
+                try:
+                    s = f"<repr failed: {type(x).__name__}>"
+                except Exception:
+                    s = "<repr failed>"
+            if len(s) > int(limit):
+                s = s[: int(limit)] + "..."
+            return s
+
+        def _try_serialize(a: Any) -> Any:
+            try:
+                fn = getattr(a, "serialize", None)
+                if callable(fn):
+                    try:
+                        return fn(player=player)
+                    except TypeError:
+                        try:
+                            return fn(player)
+                        except Exception:
+                            return None
+                    except Exception:
+                        return None
+            except Exception:
+                return None
+            return None
+
+        def _action_brief(a: Any) -> str:
+            if a is None:
+                return "None"
+            try:
+                parts = [f"type={type(a).__name__}"]
+                try:
+                    nm = getattr(a, "name", None)
+                    if nm is not None:
+                        parts.append(f"name={nm}")
+                except Exception:
+                    pass
+                try:
+                    at = getattr(a, "action_type", None)
+                    if at is not None:
+                        parts.append(f"action_type={at}")
+                except Exception:
+                    pass
+                try:
+                    ser = _try_serialize(a)
+                    if ser is not None:
+                        parts.append(f"serialize={_safe_repr(ser, limit=360)}")
+                except Exception:
+                    pass
+                return " ".join(parts)
+            except Exception:
+                return _safe_repr(a)
+
+        def _actions_sample(lst: Any, k: int = 5) -> List[str]:
+            try:
+                if not isinstance(lst, list):
+                    return [f"<not_list type={type(lst).__name__} repr={_safe_repr(lst, limit=360)}>"]
+                return [_action_brief(a) for a in lst[: int(k)]]
+            except Exception:
+                return ["<actions_sample failed>"]
+
+        def _ids_sample(lst: Any, k: int = 8) -> str:
+            try:
+                if isinstance(lst, tuple):
+                    try:
+                        lst = list(lst)
+                    except Exception:
+                        pass
+                if not isinstance(lst, list):
+                    return f"<not_list type={type(lst).__name__} repr={_safe_repr(lst, limit=360)}>"
+                return _safe_repr(lst[: int(k)], limit=520)
+            except Exception:
+                return "<ids_sample failed>"
+
+        def _dump_header(tag: str, ids_obj: Any = None, extra: str = "") -> None:
+            try:
+                print(
+                    f"[MCTS_ENV][LA5][{tag}]"
+                    f" player={getattr(player, 'name', None)}"
+                    f" conv={type(conv).__name__}"
+                    f" actions_type={type(actions).__name__ if actions is not None else None}"
+                    f" actions_len={len(actions) if isinstance(actions, list) else 'NA'}"
+                    f" actions_sample={_safe_repr(_actions_sample(actions), limit=1600)}"
+                    f" ids_type={type(ids_obj).__name__ if ids_obj is not None else None}"
+                    f" ids_len={len(ids_obj) if isinstance(ids_obj, list) else 'NA'}"
+                    f" ids_sample={_ids_sample(ids_obj)}"
+                    f"{extra}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        try:
+            try:
+                ids = conv.convert_legal_actions(actions, player=player)
+            except TypeError:
+                ids = conv.convert_legal_actions(actions)
+        except Exception as e:
+            _dump_header(
+                "CONVERT_EXCEPTION",
+                ids_obj=None,
+                extra=f" exc={type(e).__name__}:{_safe_repr(e, limit=360)}",
+            )
+            raise
+
+        if ids is None:
+            _dump_header("CONVERT_NONE", ids_obj=ids)
+            raise RuntimeError("MatchPlayerSimEnv: converter.convert_legal_actions returned None.")
+
+        # numpy/tuple 等を含みうるので 1つずつ正規化
+        out: List[List[int]] = []
+        try:
+            if isinstance(ids, tuple):
+                ids = list(ids)
+        except Exception:
+            pass
+
+        if not isinstance(ids, list):
+            _dump_header("CONVERT_NOT_LIST", ids_obj=ids)
+            raise RuntimeError("MatchPlayerSimEnv: converter.convert_legal_actions must return a list-like object.")
+
+        if len(ids) != len(actions):
+            _dump_header(
+                "LEN_MISMATCH",
+                ids_obj=ids,
+                extra=f" len_actions={len(actions) if isinstance(actions, list) else 'NA'} len_ids={len(ids) if isinstance(ids, list) else 'NA'}",
+            )
+            raise RuntimeError(
+                "MatchPlayerSimEnv._convert_legal_actions_5int: len mismatch between actions and converted ids. "
+                "This indicates converter.convert_legal_actions output is inconsistent with the input actions. "
+                f"src={__file__} turn={getattr(self._match, 'turn', None)} player={getattr(player, 'name', None)} "
+                f"len_actions={len(actions) if isinstance(actions, list) else 'NA'} len_ids={len(ids) if isinstance(ids, list) else 'NA'}"
+            )
+
+        for i, vec in enumerate(ids):
+            v = self._coerce_5int(vec, action_obj=actions[i], player=player)
+            if v is None:
+                try:
+                    a_i = actions[i] if isinstance(actions, list) and i < len(actions) else None
+
+                    ser_raw = _try_serialize(a_i) if a_i is not None else None
+                    ser_5 = None
+                    if ser_raw is not None:
+                        ser_5 = self._coerce_5int(ser_raw, action_obj=a_i, player=player)
+
+                    vec_eq_ser_raw = False
+                    vec_eq_ser_5 = False
+                    try:
+                        vec_eq_ser_raw = (vec == ser_raw)
+                    except Exception:
+                        vec_eq_ser_raw = False
+                    try:
+                        vec_eq_ser_5 = (vec == ser_5)
+                    except Exception:
+                        vec_eq_ser_5 = False
+
+                    print(
+                        "[MCTS_ENV][LA5][COERCE_FAIL]"
+                        f" player={getattr(player, 'name', None)}"
+                        f" conv={type(conv).__name__}"
+                        f" i={i} len_actions={len(actions)}"
+                        f" action_i={_action_brief(a_i)}"
+                        f" vec_type={type(vec).__name__ if vec is not None else None}"
+                        f" vec={_safe_repr(vec)}"
+                        f" serialize_raw={_safe_repr(ser_raw, limit=360)}"
+                        f" serialize_5={_safe_repr(ser_5, limit=360)}"
+                        f" vec_eq_serialize_raw={vec_eq_ser_raw}"
+                        f" vec_eq_serialize_5={vec_eq_ser_5}",
+                        flush=True,
+                    )
+                    # 直前の周辺も併記（重いので先頭数件だけ）
+                    print(
+                        "[MCTS_ENV][LA5][COERCE_FAIL_CTX]"
+                        f" actions_sample={[ _action_brief(a) for a in (actions[:5] if isinstance(actions, list) else []) ]}"
+                        f" ids_sample={_safe_repr(ids[:5] if isinstance(ids, list) else ids)}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                raise RuntimeError("MatchPlayerSimEnv: converter.convert_legal_actions did not yield a 5-int id vector.")
+            out.append(v)
+
+        try:
+            if __import__("os").getenv("MCTS_ENV_LA5_LOG", "0") == "1":
+                c = int(getattr(self, "_la5_dbg_count", 0) or 0)
+                if c < 20:
+                    setattr(self, "_la5_dbg_count", c + 1)
+                    print(
+                        f"[MCTS_ENV][LA5][OK] turn={int(getattr(self._match, 'turn', 0) or 0)} "
+                        f"player={getattr(player, 'name', type(player).__name__)} "
+                        f"n_actions={int(len(actions))} ids_sample={out[:5]}",
+                        flush=True,
+                    )
+        except Exception:
+            pass
+
+        return out
+
+    def _start_turn_for_player(self, player: Player) -> None:
+        """
+        次手番の開始処理（ドロー等）。
+        シグネチャ違いを吸収するが、失敗は停止（フォールバック禁止）。
+        """
+        try:
+            player.setup_turn(self._match, viewing_player=None)
+            return
+        except TypeError:
+            pass
+
+        player.setup_turn(self._match)
+
+    def get_obs_vec(self) -> List[float]:
+        """
+        現在手番プレイヤー視点の obs_vec（list[float]）を返す。
+
+        ルール:
+        - Match.build_public_state_for_ui(viewer=current_player) を「唯一の正」として使用する。
+        - obs_vec が無い場合は match.encoder.encode_state(sd) を試し、それでも無ければ停止する。
+        """
+        cur = self._get_current_player()
+        m = self._match
+
+        if not hasattr(m, "build_public_state_for_ui"):
+            raise RuntimeError("MatchPlayerSimEnv.get_obs_vec: match.build_public_state_for_ui is missing.")
+
+        sd = m.build_public_state_for_ui(viewer=cur)
+        if not isinstance(sd, dict):
+            raise RuntimeError("MatchPlayerSimEnv.get_obs_vec: build_public_state_for_ui did not return a dict.")
+
+        obs = sd.get("obs_vec", None)
+        if obs is None:
+            try:
+                obs = sd.get("full_obs_vec", None)
+                if obs is not None:
+                    try:
+                        import os
+                        k = "_mcts_env_obs_fallback_full_budget"
+                        b = getattr(m, k, None)
+                        if b is None:
+                            b = int(os.getenv("MCTS_ENV_OBS_FALLBACK_FULL_BUDGET", "6") or "6")
+                        b = int(b)
+                        if b > 0:
+                            setattr(m, k, b - 1)
+                            vlen = None
+                            try:
+                                vlen = len(obs)
+                            except Exception:
+                                vlen = None
+                            print(
+                                f"[MCTS_ENV][OBS_FALLBACK_FULL] turn={getattr(m,'turn',None)} cur={getattr(cur,'name',None)} "
+                                f"type={type(obs).__name__} len={vlen}",
+                                flush=True,
+                            )
+                    except Exception:
+                        pass
+            except Exception:
+                obs = None
+
+        if obs is None:
+            enc = getattr(m, "encoder", None)
+            try:
+                fn = getattr(enc, "encode_state", None) if enc is not None else None
+                if callable(fn):
+                    try:
+                        fn(sd, player=cur)
+                    except TypeError:
+                        try:
+                            fn(sd, cur)
+                        except Exception:
+                            fn(sd)
+            except Exception:
+                pass
+
+            try:
+                obs = sd.get("obs_vec", None)
+            except Exception:
+                obs = None
+
+            if obs is None and enc is not None and callable(enc):
+                try:
+                    enc(sd, None)
+                except TypeError:
+                    try:
+                        enc(public_state=sd, legal_actions=None)
+                    except TypeError:
+                        try:
+                            enc(player=sd, legal_actions=None)
+                        except Exception:
+                            try:
+                                enc(sd)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
-            if vec_key == action_key:
-                selected_action = a
-                break
+            try:
+                obs = sd.get("obs_vec", None)
+            except Exception:
+                obs = None
 
-        if selected_action is None:
-            raise ValueError("MatchPlayerSimEnv.step: action not found in current legal_actions().")
+            if obs is None:
+                for k in ("obs_vec", "full_obs_vec", "obs_vec_az", "az_obs_vec", "observation_vec", "obs", "x"):
+                    try:
+                        v = sd.get(k, None)
+                    except Exception:
+                        v = None
+                    if v is not None:
+                        obs = v
+                        break
 
-        # 盤面更新とログ出力を含め、実環境と同じ経路で 1 手進める。
-        # 戻り値（次の合法手群）はここでは利用せず、次回の legal_actions() 呼び出し時に
-        # gather_actions で再度列挙する前提とする。
-        self._player.act_and_regather_actions(self._match, selected_action)
+        if obs is None:
+            try:
+                ks = sorted(list(sd.keys()))
+            except Exception:
+                ks = None
+            raise RuntimeError(
+                "MatchPlayerSimEnv.get_obs_vec: obs_vec is None (encoder not producing it). "
+                f"keys={ks} encoder={type(getattr(m, 'encoder', None)).__name__ if getattr(m, 'encoder', None) is not None else None} src={__file__}"
+            )
+
+        # list[float] へ正規化
+        try:
+            if isinstance(obs, tuple):
+                obs = list(obs)
+            # numpy
+            try:
+                import numpy as np
+                if isinstance(obs, np.ndarray):
+                    obs = obs.reshape(-1).tolist()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if not isinstance(obs, list) or not obs:
+            raise RuntimeError("MatchPlayerSimEnv.get_obs_vec: obs_vec must be a non-empty list.")
+
+        out = []
+        for x in obs:
+            try:
+                out.append(float(x))
+            except Exception:
+                raise RuntimeError("MatchPlayerSimEnv.get_obs_vec: obs_vec contains a non-numeric value.")
+
+        return out
+
+    def _refresh_action_cache(self, player: Player) -> None:
+        """
+        現在状態の合法手を列挙し、5-int と Action の対応表をキャッシュする。
+
+        forced_actions がある場合は forced_actions を優先し、
+        forced 中は turn を進めない前提で「forced のみ」から 5-int -> Action 対応を作る。
+
+        - converter 出力に重複 5-int が存在する場合は原則停止（デコード不能を明確化）。
+          どうしても許容する場合は env: MCTS_ENV_ALLOW_DUP_IDS=1（先勝ち）で回避。
+        """
+        import os
+
+        m = self._match
+        try:
+            turn = int(getattr(m, "turn", 0) or 0)
+        except Exception:
+            turn = None
+
+        forced_raw = self._get_forced_actions_raw()
+        forced_active = self._forced_is_active()
+        forced_len = None
+        try:
+            if isinstance(forced_raw, (list, tuple)):
+                forced_len = int(len(forced_raw))
+        except Exception:
+            forced_len = None
+
+        actions = []
+        ids = []
+
+        if forced_active and isinstance(forced_raw, (list, tuple)):
+            # forced_actions が Action 群（実行体）か、5-int 群（ID）かを判定
+            all_5int_like = True
+            forced_ids = []
+            for x in list(forced_raw):
+                v = self._coerce_5int(x, action_obj=None, player=player)
+                if v is None:
+                    all_5int_like = False
+                    break
+                forced_ids.append(v)
+
+            if all_5int_like:
+                # forced_actions が 5-int 群の場合:
+                # 通常の gather_actions+converter で Action を用意し、その中から forced のみフィルタする
+                all_actions = player.gather_actions(self._match) or []
+                all_ids = self._convert_legal_actions_5int(all_actions, player) if all_actions else []
+
+                full_lookup = {}
+                for i, vec in enumerate(all_ids):
+                    full_lookup[tuple(vec)] = all_actions[i]
+
+                actions = []
+                ids = []
+                for v in forced_ids:
+                    a = full_lookup.get(tuple(v), None)
+                    if a is None:
+                        raise RuntimeError(
+                            "MatchPlayerSimEnv._refresh_action_cache: forced 5-int not found in current legal actions. "
+                            f"turn={turn} player={getattr(player,'name',None)} forced_id={v}"
+                        )
+                    actions.append(a)
+                    ids.append(v)
+            else:
+                # forced_actions が Action 群（実行体）の場合: forced_actions 自体を actions として採用
+                actions = list(forced_raw)
+                ids = self._convert_legal_actions_5int(actions, player) if actions else []
+        else:
+            actions = player.gather_actions(self._match) or []
+            ids = self._convert_legal_actions_5int(actions, player) if actions else []
+
+        lookup = {}
+        dup_keys = []
+        for i, vec in enumerate(ids):
+            k = tuple(vec)
+            if k in lookup:
+                dup_keys.append(k)
+            else:
+                lookup[k] = actions[i]
+
+        allow_dup = (os.getenv("MCTS_ENV_ALLOW_DUP_IDS", "0") == "1")
+        if dup_keys and not allow_dup:
+            try:
+                from collections import Counter
+                top = Counter(dup_keys).most_common(8)
+            except Exception:
+                top = [(dup_keys[0], len(dup_keys))]
+
+            try:
+                print(
+                    "[MCTS_ENV][LA5][DUP_IDS]"
+                    f" turn={turn} player={getattr(player,'name',None)}"
+                    f" forced_active={forced_active}"
+                    f" forced_len={forced_len}"
+                    f" dup_top={top}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+            raise RuntimeError("MatchPlayerSimEnv: duplicate 5-int ids detected in converter output.")
+
+        self._la_cache_turn = turn
+        self._la_cache_player_name = getattr(player, "name", None)
+        self._la_cache_actions = actions
+        self._la_cache_ids = ids
+        self._la_cache_lookup = lookup
+        self._la_cache_forced_len = forced_len
+        self._la_cache_forced_player_name = getattr(self._get_forced_player(), "name", None) if forced_active else None
+
+    def legal_actions(self) -> List[Any]:
+        """
+        現在手番プレイヤーにとっての合法手 ID（5-int）リストを返す。
+
+        forced_actions がある場合は forced_actions を優先し、forced 中は turn を進めない前提で返す。
+        """
+        cur = self._get_current_player()
+
+        self._refresh_action_cache(cur)
+
+        try:
+            ids = getattr(self, "_la_cache_ids", None)
+        except Exception:
+            ids = None
+
+        return ids if isinstance(ids, list) else []
+
+    def step(self, action: Any) -> None:
+        """
+        指定された action（5-int ID）を 1手適用して内部状態を進める。
+
+        forced 中の規則:
+        - forced_actions が残っている間は turn を進めない
+        - forced_actions を消化し切ったタイミングでのみ、can_continue=False なら turn を進める
+        """
+        forced_before = self._forced_is_active()
+
+        cur = self._get_current_player()
+
+        target = self._coerce_5int(action, action_obj=None, player=cur)
+        if target is None:
+            raise RuntimeError("MatchPlayerSimEnv.step: action must be a 5-int id vector.")
+
+        pre_turn = None
+        try:
+            pre_turn = int(getattr(self._match, "turn", 0) or 0)
+        except Exception:
+            pre_turn = None
+
+        now_turn = None
+        try:
+            now_turn = int(getattr(self._match, "turn", 0) or 0)
+        except Exception:
+            now_turn = None
+
+        forced_len_now = None
+        try:
+            fr = self._get_forced_actions_raw()
+            if isinstance(fr, (list, tuple)):
+                forced_len_now = int(len(fr))
+        except Exception:
+            forced_len_now = None
+
+        forced_player_name_now = getattr(self._get_forced_player(), "name", None) if forced_before else None
+
+        cache_ok = False
+        try:
+            cache_ok = (
+                getattr(self, "_la_cache_turn", None) == now_turn
+                and getattr(self, "_la_cache_player_name", None) == getattr(cur, "name", None)
+                and isinstance(getattr(self, "_la_cache_lookup", None), dict)
+                and getattr(self, "_la_cache_forced_len", None) == forced_len_now
+                and getattr(self, "_la_cache_forced_player_name", None) == forced_player_name_now
+            )
+        except Exception:
+            cache_ok = False
+
+        if not cache_ok:
+            self._refresh_action_cache(cur)
+
+        lookup = None
+        actions = None
+        ids = None
+        try:
+            lookup = getattr(self, "_la_cache_lookup", None)
+            actions = getattr(self, "_la_cache_actions", None)
+            ids = getattr(self, "_la_cache_ids", None)
+        except Exception:
+            lookup = None
+            actions = None
+            ids = None
+
+        chosen = None
+        try:
+            if isinstance(lookup, dict):
+                chosen = lookup.get(tuple(target), None)
+        except Exception:
+            chosen = None
+
+        if chosen is None:
+            # 1回だけ再構築して再試行（forced 切替や gather_actions の揺れを吸収）
+            self._refresh_action_cache(cur)
+
+            try:
+                lookup = getattr(self, "_la_cache_lookup", None)
+                actions = getattr(self, "_la_cache_actions", None)
+                ids = getattr(self, "_la_cache_ids", None)
+            except Exception:
+                lookup = None
+                actions = None
+                ids = None
+
+            try:
+                if isinstance(lookup, dict):
+                    chosen = lookup.get(tuple(target), None)
+            except Exception:
+                chosen = None
+
+        if chosen is None:
+            def _safe_repr(x: Any, limit: int = 640) -> str:
+                try:
+                    s = repr(x)
+                except Exception:
+                    s = f"<repr failed: {type(x).__name__}>"
+                if len(s) > int(limit):
+                    s = s[: int(limit)] + "..."
+                return s
+
+            def _try_serialize(a: Any) -> Any:
+                try:
+                    fn = getattr(a, "serialize", None)
+                    if callable(fn):
+                        try:
+                            return fn(player=cur)
+                        except TypeError:
+                            try:
+                                return fn(cur)
+                            except Exception:
+                                return None
+                        except Exception:
+                            return None
+                except Exception:
+                    return None
+                return None
+
+            def _action_brief(a: Any) -> str:
+                if a is None:
+                    return "None"
+                try:
+                    parts = [f"type={type(a).__name__}"]
+                    try:
+                        nm = getattr(a, "name", None)
+                        if nm is not None:
+                            parts.append(f"name={nm}")
+                    except Exception:
+                        pass
+                    try:
+                        at = getattr(a, "action_type", None)
+                        if at is not None:
+                            parts.append(f"action_type={at}")
+                    except Exception:
+                        pass
+                    try:
+                        ser = _try_serialize(a)
+                        if ser is not None:
+                            parts.append(f"serialize={_safe_repr(ser, limit=240)}")
+                    except Exception:
+                        pass
+                    return " ".join(parts)
+                except Exception:
+                    return _safe_repr(a, limit=240)
+
+            try:
+                print(
+                    "[MCTS_ENV][LA5][STEP_NO_MATCH]"
+                    f" player={getattr(cur, 'name', None)}"
+                    f" turn={getattr(self._match, 'turn', None)}"
+                    f" forced_before={forced_before}"
+                    f" target={_safe_repr(target, limit=120)}"
+                    f" cache_ok={cache_ok}"
+                    f" actions_len={len(actions) if isinstance(actions, list) else 'NA'}"
+                    f" ids_len={len(ids) if isinstance(ids, list) else 'NA'}"
+                    f" actions_sample={_safe_repr([_action_brief(a) for a in (actions[:5] if isinstance(actions, list) else [])], limit=980)}"
+                    f" ids_sample={_safe_repr((ids[:10] if isinstance(ids, list) else ids), limit=520)}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                "MatchPlayerSimEnv.step: could not find the Action object for the given 5-int id (cache+converter-based). "
+                "This indicates policy output is not in legal_actions, or converter output is unstable."
+            )
+
+        # 実行（ログ等の副作用は clone() 側で可能な限り無効化している前提）
+        cur.act_and_regather_actions(self._match, chosen)
+
+        # 以降の状態ではキャッシュは古いので無効化
+        try:
+            self._la_cache_turn = None
+            self._la_cache_player_name = None
+            self._la_cache_actions = None
+            self._la_cache_ids = None
+            self._la_cache_lookup = None
+            self._la_cache_forced_len = None
+            self._la_cache_forced_player_name = None
+        except Exception:
+            pass
+
+        # 終局ならここで終了（turn の進行は不要）
+        if self.is_terminal():
+            return
+
+        forced_after = self._forced_is_active()
+
+        # forced 中は turn を進めない（forced を消化し切った時だけ advance 判定へ）
+        if forced_after:
+            return
+
+        # ターンが切り替わるなら match.turn を進め、次手番の開始処理を行う
+        try:
+            can_cont = bool(getattr(cur, "can_continue", True))
+        except Exception:
+            can_cont = True
+
+        if not can_cont:
+            # forced が開始されていた場合は「消化し切ったタイミング」でのみ進める
+            if forced_before and not forced_after:
+                pass
+
+            # Match.play_one_match の規則: ターン終了時に match.turn を必ず +1 する
+            try:
+                now_turn = int(getattr(self._match, "turn", 0) or 0)
+            except Exception:
+                now_turn = None
+
+            if pre_turn is None or now_turn is None:
+                raise RuntimeError("MatchPlayerSimEnv.step: cannot read match.turn for turn-advance check.")
+
+            if now_turn != pre_turn:
+                raise RuntimeError(
+                    "MatchPlayerSimEnv.step: match.turn changed during a single action, "
+                    "but Match.play_one_match only advances turn at the end of a turn. "
+                    f"pre_turn={pre_turn} now_turn={now_turn}"
+                )
+
+            try:
+                self._match.turn = pre_turn + 1
+            except Exception:
+                raise RuntimeError("MatchPlayerSimEnv.step: failed to advance match.turn on turn end.")
+
+            nxt = self._get_current_player()
+
+            # 次手番の開始処理（ドロー等）
+            self._start_turn_for_player(nxt)
+
+            # 念のため（can_continue を参照する実装があっても壊れないように）
+            try:
+                setattr(nxt, "can_continue", True)
+            except Exception:
+                pass
 
     def is_terminal(self) -> bool:
         """
         現在の状態が終局かどうかを返す。
 
-        将来的には match.game_over や winner, _end_reason を参照して
-        判定する実装として、現時点では match.game_over をそのまま返す。
+        - match.game_over が True なら終局
+        - turn > 100 は TURN_LIMIT として終局扱い
+        - match._infer_end_reason() がある場合、DECK_OUT / TURN_LIMIT を補完して終局扱い
         """
         m = self._match
-        return bool(getattr(m, "game_over", False))
+
+        if bool(getattr(m, "game_over", False)):
+            return True
+
+        try:
+            t = int(getattr(m, "turn", 0) or 0)
+        except Exception:
+            t = 0
+
+        if t > 100:
+            try:
+                if not getattr(m, "_end_reason", None):
+                    setattr(m, "_end_reason", "TURN_LIMIT")
+            except Exception:
+                pass
+            return True
+
+        try:
+            fn = getattr(m, "_infer_end_reason", None)
+            if callable(fn):
+                r = fn()
+                if isinstance(r, str) and r.upper() in ("DECK_OUT", "TURN_LIMIT"):
+                    try:
+                        if not getattr(m, "_end_reason", None):
+                            setattr(m, "_end_reason", r.upper())
+                    except Exception:
+                        pass
+                    return True
+        except Exception:
+            pass
+
+        return False
 
     def result(self) -> float:
         """
@@ -486,7 +1429,19 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         root_name = self._root_player_name
         winner = getattr(self._match, "winner", None)
 
-        if not winner or root_name is None:
+        if winner is None or root_name is None:
             return 0.0
 
-        return 1.0 if winner == root_name else -1.0
+        # winner が name 文字列でない実装もありうるため、可能な限り name に寄せて比較する
+        try:
+            if isinstance(winner, str):
+                wname = winner
+            else:
+                wname = getattr(winner, "name", None)
+        except Exception:
+            wname = None
+
+        if wname is None:
+            return 0.0
+
+        return 1.0 if wname == root_name else -1.0
