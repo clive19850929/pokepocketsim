@@ -1,5 +1,4 @@
 numpy
-torch
 d3rlpy
 tqdm
 pygame
