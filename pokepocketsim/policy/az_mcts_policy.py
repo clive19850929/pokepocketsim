@@ -570,6 +570,7 @@ class AlphaZeroMCTSPolicy:
 
                 payload = {
                     "error_type": type(e).__name__,
+                    "exception_class": type(e).__name__,
                     "error_message": str(e),
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                     "run_context": {
@@ -592,13 +593,14 @@ class AlphaZeroMCTSPolicy:
                 import os
 
                 dump_path = write_debug_dump(payload)
-                try:
-                    cwd = os.getcwd()
-                    rel = os.path.relpath(dump_path, cwd)
-                except Exception:
-                    cwd = None
-                    rel = dump_path
-                print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}", flush=True)
+                if dump_path is not None:
+                    try:
+                        cwd = os.getcwd()
+                        rel = os.path.relpath(dump_path, cwd)
+                    except Exception:
+                        cwd = None
+                        rel = dump_path
+                    print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}", flush=True)
                 raise
             if not (isinstance(mcts_pi, list) and int(len(mcts_pi)) == int(len(legal_action_ids))):
                 raise RuntimeError("[AZ] _run_mcts returned invalid pi (no fallback).")
@@ -1291,6 +1293,7 @@ class AlphaZeroMCTSPolicy:
 
                 payload = {
                     "error_type": "total_visits<=0",
+                    "exception_class": "RuntimeError",
                     "error_message": "[AZ][MCTS] total_visits<=0 (no fallback).",
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                     "run_context": {
@@ -1320,13 +1323,14 @@ class AlphaZeroMCTSPolicy:
                 import os
 
                 dump_path = write_debug_dump(payload)
-                try:
-                    cwd = os.getcwd()
-                    rel = os.path.relpath(dump_path, cwd)
-                except Exception:
-                    cwd = None
-                    rel = dump_path
-                print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}", flush=True)
+                if dump_path is not None:
+                    try:
+                        cwd = os.getcwd()
+                        rel = os.path.relpath(dump_path, cwd)
+                    except Exception:
+                        cwd = None
+                        rel = dump_path
+                    print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}", flush=True)
             except Exception:
                 pass
             raise RuntimeError("[AZ][MCTS] total_visits<=0 (no fallback).")
