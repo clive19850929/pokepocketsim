@@ -116,6 +116,54 @@ class OnlineMixedPolicy:
             pass
         return s
 
+    def _format_list_head_tail(self, items: Any, full: bool = False) -> str:
+        import os
+
+        if not isinstance(items, list):
+            return self._short_repr(items, max_chars=1200)
+
+        mode = str(os.getenv("MCTS_ENV_LA5_LIST_MODE", "headtail")).strip().lower()
+        if full or mode == "full":
+            return self._short_repr(items, max_chars=6000)
+
+        try:
+            k = int(os.getenv("MCTS_ENV_LA5_LIST_K", "6") or "6")
+        except Exception:
+            k = 6
+
+        if k <= 0 or len(items) <= 2 * k:
+            return self._short_repr(items, max_chars=2400)
+
+        head = items[:k]
+        tail = items[-k:]
+        return f"{self._short_repr(head, max_chars=2400)}...{self._short_repr(tail, max_chars=2400)}(len={len(items)})"
+
+    def _trace_enabled(self) -> bool:
+        import os
+
+        return str(os.getenv("MCTS_ENV_TRACE", "0")).strip() == "1"
+
+    def _next_la5_event_id(self) -> str:
+        import time
+
+        try:
+            c = int(getattr(self, "_la5_event_counter", 0) or 0) + 1
+        except Exception:
+            c = 1
+        try:
+            setattr(self, "_la5_event_counter", c)
+        except Exception:
+            pass
+        return f"la5_online_{int(time.time() * 1000)}_{int(c)}"
+
+    def _hash_vecs(self, vecs: Any) -> Optional[str]:
+        from .trace_utils import hash_vecs
+
+        return hash_vecs(vecs)
+
+    def _hash_vec(self, vec: Any) -> Optional[str]:
+        return self._hash_vecs(vec)
+
     def _value_outline(self, v, sample_n: int = 6) -> dict:
         """
         値の「型・長さ・先頭サンプル・dictキー等」を安全に要約して返す。
@@ -823,8 +871,16 @@ class OnlineMixedPolicy:
                     "mcts_context": None,
                     "traceback": traceback.format_exception(type(e), e, e.__traceback__),
                 }
+                import os
+
                 dump_path = write_debug_dump(payload)
-                print(f"[DEBUG_DUMP] wrote: {dump_path}", flush=True)
+                try:
+                    cwd = os.getcwd()
+                    rel = os.path.relpath(dump_path, cwd)
+                except Exception:
+                    cwd = None
+                    rel = dump_path
+                print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}", flush=True)
             except Exception:
                 pass
             if os.getenv("STRICT_POLICY_ERROR") == "1":
@@ -1533,14 +1589,84 @@ class OnlineMixedPolicy:
                         la_ids = tmp
 
                     la_5 = _coerce_5int_rows(la_ids)
+                    event_id = self._next_la5_event_id()
+                    la_5_hash = self._hash_vecs(la_5)
+                    obs_vec = None
+                    try:
+                        obs_vec = state_dict.get("obs_vec", None)
+                    except Exception:
+                        obs_vec = None
+                    state_fingerprint = self._hash_vec(obs_vec) if obs_vec is not None else None
 
                     # ★必ず state_dict に 5-int を積む（main が受け取る正式入口）
                     try:
                         state_dict["legal_actions_5"] = la_5
                         state_dict["legal_actions_vec"] = la_5
                         state_dict["legal_actions"] = la_5
+                        state_dict["la5_event_id"] = event_id
+                        state_dict["legal_actions_vec_hash"] = la_5_hash
+                        state_dict["trace_state_fingerprint"] = state_fingerprint
                     except Exception:
                         pass
+
+                    if self._trace_enabled():
+                        try:
+                            game_id = None
+                            turn = None
+                            player_name = None
+                            forced_active = None
+                            forced_len = None
+                            try:
+                                m = getattr(player, "match", None) if player is not None else None
+                                game_id = getattr(m, "game_id", None) if m is not None else None
+                                turn = getattr(m, "turn", None) if m is not None else None
+                                fa = getattr(m, "forced_actions", None) if m is not None else None
+                                if isinstance(fa, (list, tuple)):
+                                    forced_len = int(len(fa))
+                                    forced_active = forced_len > 0
+                            except Exception:
+                                game_id = None
+                                turn = None
+                                forced_active = None
+                                forced_len = None
+                            try:
+                                player_name = getattr(player, "name", None) if player is not None else None
+                            except Exception:
+                                player_name = None
+                            import json
+
+                            trace_payload = {
+                                "event_id": event_id,
+                                "game_id": game_id,
+                                "turn": turn,
+                                "player": player_name,
+                                "forced_active": forced_active,
+                                "forced_len": forced_len,
+                                "state_fingerprint_online": state_fingerprint,
+                                "state_fingerprint_env": None,
+                                "n_actions": len(actions) if isinstance(actions, list) else None,
+                                "n_ids": len(la_5) if isinstance(la_5, list) else None,
+                                "legal_actions_vec_hash": la_5_hash,
+                                "legal_actions_vec": la_5 if isinstance(la_5, list) else None,
+                            }
+                            print(
+                                "[ONLINE_MIX][LA5][TRACE_A]"
+                                f" event_id={event_id}"
+                                f" game_id={game_id}"
+                                f" turn={turn}"
+                                f" player={player_name}"
+                                f" forced_active={forced_active}"
+                                f" forced_len={forced_len}"
+                                f" state_fingerprint={state_fingerprint}"
+                                f" n_actions={len(actions) if isinstance(actions, list) else 'NA'}"
+                                f" n_ids={len(la_5) if isinstance(la_5, list) else 'NA'}"
+                                f" legal_actions_vec_hash={la_5_hash}"
+                                f" legal_actions_vec_full={self._format_list_head_tail(la_5, full=False)}"
+                                f" trace_json={json.dumps(trace_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)}",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
 
                     # ★main が欲しい candidate 次元に合わせて作る（cand_dim=5 を最優先）
                     _target_cand_dim = None
@@ -1851,6 +1977,67 @@ class OnlineMixedPolicy:
                     state_dict["online_mix_why"] = str(_why)
             except Exception:
                 pass
+
+            if self._trace_enabled():
+                try:
+                    event_id = None
+                    generated_new = 0
+                    state_fingerprint = None
+                    state_fingerprint_env = None
+                    la_5_hash = None
+                    la_5 = None
+                    try:
+                        event_id = state_dict.get("la5_event_id", None)
+                        state_fingerprint = state_dict.get("trace_state_fingerprint", None)
+                        state_fingerprint_env = state_dict.get("env_state_fingerprint", None)
+                        la_5_hash = state_dict.get("legal_actions_vec_hash", None)
+                        la_5 = state_dict.get("legal_actions_5", None)
+                    except Exception:
+                        event_id = None
+                        state_fingerprint = None
+                        state_fingerprint_env = None
+                        la_5_hash = None
+                        la_5 = None
+                    if event_id is None:
+                        event_id = self._next_la5_event_id()
+                        generated_new = 1
+                        try:
+                            state_dict["la5_event_id"] = event_id
+                        except Exception:
+                            pass
+                    selected_vec = None
+                    try:
+                        if isinstance(la_5, list) and 0 <= int(_idx) < len(la_5):
+                            selected_vec = la_5[int(_idx)]
+                    except Exception:
+                        selected_vec = None
+                    import json
+
+                    trace_payload = {
+                        "event_id": event_id,
+                        "generated_new": int(generated_new),
+                        "selection_source": _source,
+                        "selected_idx": int(_idx),
+                        "selected_vec": selected_vec,
+                        "state_fingerprint_online": state_fingerprint if state_fingerprint is not None else "NA",
+                        "state_fingerprint_env": state_fingerprint_env if state_fingerprint_env is not None else "NA",
+                        "legal_actions_vec_hash": la_5_hash,
+                    }
+                    print(
+                        "[ONLINE_MIX][TRACE_B]"
+                        f" event_id={event_id}"
+                        f" generated_new={generated_new}"
+                        f" selection_source={_source}"
+                        f" selected_idx={int(_idx)}"
+                        f" selected_vec={self._format_list_head_tail(selected_vec, full=True)}"
+                        f" state_fingerprint_online={state_fingerprint if state_fingerprint is not None else 'NA'}"
+                        f" state_fingerprint_env={state_fingerprint_env if state_fingerprint_env is not None else 'NA'}"
+                        f" legal_actions_vec_hash={la_5_hash}"
+                        f" trace_json={json.dumps(trace_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
 
             if str(_source) == "random" and _why is not None:
                 try:

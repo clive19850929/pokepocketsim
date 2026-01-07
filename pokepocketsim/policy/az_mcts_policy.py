@@ -589,8 +589,16 @@ class AlphaZeroMCTSPolicy:
                     },
                     "traceback": traceback.format_exception(type(e), e, e.__traceback__),
                 }
+                import os
+
                 dump_path = write_debug_dump(payload)
-                print(f"[DEBUG_DUMP] wrote: {dump_path}", flush=True)
+                try:
+                    cwd = os.getcwd()
+                    rel = os.path.relpath(dump_path, cwd)
+                except Exception:
+                    cwd = None
+                    rel = dump_path
+                print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}", flush=True)
                 raise
             if not (isinstance(mcts_pi, list) and int(len(mcts_pi)) == int(len(legal_action_ids))):
                 raise RuntimeError("[AZ] _run_mcts returned invalid pi (no fallback).")
@@ -961,6 +969,11 @@ class AlphaZeroMCTSPolicy:
             tail = vecs[-k:]
             return f"{_safe_repr(head, limit=2400)}...{_safe_repr(tail, limit=2400)}(len={len(vecs)})"
 
+        def _hash_vec_list(vecs) -> Optional[str]:
+            from .trace_utils import hash_vecs
+
+            return hash_vecs(vecs)
+
         def _get_env_ctx(_env):
             try:
                 fn = getattr(_env, "_get_log_context", None)
@@ -1020,13 +1033,76 @@ class AlphaZeroMCTSPolicy:
                         if best_child.action_from_parent is None:
                             raise RuntimeError("[AZ][MCTS] selection failed: action_from_parent is None (no fallback).")
 
-                        last_action = best_child.action_from_parent
                         node_actions = []
                         try:
                             node_actions = [c.action_from_parent for c in node.children.values()]
                         except Exception:
                             node_actions = None
+                        current_actions = sim_env.legal_actions()
+                        try:
+                            action_index = current_actions.index(best_child.action_from_parent)
+                        except ValueError:
+                            raise RuntimeError("[AZ][MCTS] last_action not in legal_actions (no fallback).")
+                        last_action = current_actions[action_index]
                         pre_ctx = _get_env_ctx(sim_env)
+                        try:
+                            import os
+
+                            if str(os.getenv("MCTS_ENV_TRACE", "0")).strip() == "1":
+                                import json
+
+                                event_id = None
+                                generated_new = 0
+                                try:
+                                    event_id = getattr(sim_env, "_la_cache_event_id", None)
+                                except Exception:
+                                    event_id = None
+                                try:
+                                    if event_id is None:
+                                        fn_eid = getattr(sim_env, "_next_la5_event_id", None)
+                                        if callable(fn_eid):
+                                            event_id = fn_eid()
+                                            generated_new = 1
+                                            try:
+                                                setattr(sim_env, "_la_cache_event_id", event_id)
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    event_id = None
+                                state_fp = None
+                                try:
+                                    cur_p = getattr(sim_env, "_get_current_player", None)
+                                    if callable(cur_p):
+                                        cur_p = cur_p()
+                                    fp_fn = getattr(sim_env, "_get_state_fingerprint", None)
+                                    if callable(fp_fn):
+                                        state_fp = fp_fn(cur_p)
+                                except Exception:
+                                    state_fp = None
+                                selected_idx = None
+                                try:
+                                    if isinstance(node_actions, list):
+                                        selected_idx = node_actions.index(last_action)
+                                except Exception:
+                                    selected_idx = None
+                                print(
+                                    "[AZ][MCTS][TRACE_B]"
+                                    f" event_id={event_id}"
+                                    f" generated_new={generated_new}"
+                                    f" selection_source=mcts_tree"
+                                    f" selected_idx={selected_idx}"
+                                    f" selected_vec={_format_vec_list(last_action, full=True)}"
+                                    f" state_fingerprint_online=NA"
+                                    f" state_fingerprint_env={state_fp if state_fp is not None else 'NA'}"
+                                    f" legal_actions_vec_hash={_hash_vec_list(node_actions)}"
+                                    f" game_id={pre_ctx.get('game_id')}"
+                                    f" turn={pre_ctx.get('turn')}"
+                                    f" player={pre_ctx.get('player')}"
+                                    f" trace_json={json.dumps({'event_id': event_id,'generated_new': int(generated_new),'selection_source': 'mcts_tree','selected_idx': selected_idx,'selected_vec': last_action,'state_fingerprint_online': 'NA','state_fingerprint_env': state_fp if state_fp is not None else 'NA','legal_actions_vec_hash': _hash_vec_list(node_actions),'game_id': pre_ctx.get('game_id'),'turn': pre_ctx.get('turn'),'player': pre_ctx.get('player')}, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)}",
+                                    flush=True,
+                                )
+                        except Exception:
+                            pass
                         try:
                             sim_env.step(last_action)
                         except Exception as e:
@@ -1241,8 +1317,16 @@ class AlphaZeroMCTSPolicy:
                         },
                     },
                 }
+                import os
+
                 dump_path = write_debug_dump(payload)
-                print(f"[DEBUG_DUMP] wrote: {dump_path}", flush=True)
+                try:
+                    cwd = os.getcwd()
+                    rel = os.path.relpath(dump_path, cwd)
+                except Exception:
+                    cwd = None
+                    rel = dump_path
+                print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}", flush=True)
             except Exception:
                 pass
             raise RuntimeError("[AZ][MCTS] total_visits<=0 (no fallback).")
