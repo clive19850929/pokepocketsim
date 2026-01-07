@@ -64,6 +64,10 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         self._la_cache_forced_player_name = None
         self._la_cache_state_fingerprint = None
         self._validate_roundtrip_running = False
+        self._last_actions = None
+        self._last_action_ids = None
+        self._last_action_lookup = None
+        self._last_actions_key = None
 
     def clone(self) -> MCTSSimEnvProtocol:
         """
@@ -626,6 +630,16 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         head = items[:k]
         tail = items[-k:]
         return f"{_safe_repr(head, limit=2400)}...{_safe_repr(tail, limit=2400)}(len={len(items)})"
+
+    def _trace_enabled(self) -> bool:
+        import os
+
+        return str(os.getenv("MCTS_ENV_TRACE", "0")).strip() == "1"
+
+    def _hash_vecs(self, vecs: Any) -> Optional[str]:
+        from .trace_utils import hash_vecs
+
+        return hash_vecs(vecs)
 
     def _coerce_5int(self, vec: Any, action_obj: Any = None, player: Any = None) -> Optional[List[int]]:
         """
@@ -1260,6 +1274,8 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         actions = []
         ids = []
 
+        event_id = self._next_la5_event_id()
+
         if forced_active and isinstance(forced_raw, (list, tuple)):
             # forced_actions が Action 群（実行体）か、5-int 群（ID）かを判定
             all_5int_like = True
@@ -1336,6 +1352,49 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         except Exception:
             pass
 
+        try:
+            setattr(self, "_la_cache_event_id", event_id)
+        except Exception:
+            pass
+
+        state_fingerprint = self._get_state_fingerprint(player)
+        if self._trace_enabled():
+            try:
+                ids_hash = self._hash_vecs(ids)
+                import json
+
+                trace_payload = {
+                    "event_id": event_id,
+                    "game_id": ctx.get("game_id"),
+                    "turn": turn,
+                    "player": ctx.get("player"),
+                    "forced_active": ctx.get("forced_active"),
+                    "forced_len": forced_len,
+                    "state_fingerprint": state_fingerprint,
+                    "n_actions": len(actions) if isinstance(actions, list) else None,
+                    "n_ids": len(ids) if isinstance(ids, list) else None,
+                    "legal_actions_vec_hash": ids_hash,
+                    "legal_actions_vec": ids if isinstance(ids, list) else None,
+                }
+                print(
+                    "[MCTS_ENV][LA5][TRACE_A]"
+                    f" event_id={event_id}"
+                    f" game_id={ctx.get('game_id')}"
+                    f" turn={turn}"
+                    f" player={ctx.get('player')}"
+                    f" forced_active={ctx.get('forced_active')}"
+                    f" forced_len={forced_len}"
+                    f" state_fingerprint={state_fingerprint}"
+                    f" n_actions={len(actions) if isinstance(actions, list) else 'NA'}"
+                    f" n_ids={len(ids) if isinstance(ids, list) else 'NA'}"
+                    f" legal_actions_vec_hash={ids_hash}"
+                    f" legal_actions_vec_full={self._format_list_head_tail(ids, full=False)}"
+                    f" trace_json={json.dumps(trace_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
         lookup = {}
         dup_keys = []
         for i, vec in enumerate(ids):
@@ -1376,7 +1435,7 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         self._la_cache_lookup = lookup
         self._la_cache_forced_len = forced_len
         self._la_cache_forced_player_name = getattr(self._get_forced_player(), "name", None) if forced_active else None
-        self._la_cache_state_fingerprint = self._get_state_fingerprint(player)
+        self._la_cache_state_fingerprint = state_fingerprint
 
     def legal_actions(self) -> List[Any]:
         """
@@ -1436,11 +1495,27 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
                 raise
 
         try:
+            actions = getattr(self, "_la_cache_actions", None)
             ids = getattr(self, "_la_cache_ids", None)
         except Exception:
+            actions = None
             ids = None
 
-        return ids if isinstance(ids, list) else []
+        if not isinstance(actions, list) or not isinstance(ids, list):
+            raise RuntimeError("MatchPlayerSimEnv.legal_actions invariant failed: cache missing.")
+
+        if len(actions) != len(ids):
+            raise RuntimeError("MatchPlayerSimEnv.legal_actions invariant failed: len mismatch.")
+
+        self._last_actions = actions
+        self._last_action_ids = ids
+        self._last_action_lookup = {tuple(ids[i]): actions[i] for i in range(len(ids))}
+        try:
+            self._last_actions_key = tuple(tuple(x) for x in ids)
+        except Exception:
+            self._last_actions_key = None
+
+        return ids
 
     def debug_validate_action_roundtrip(self) -> None:
         """
@@ -1541,6 +1616,7 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
         forced_before = self._forced_is_active()
 
         cur = self._get_current_player()
+        ctx = self._get_log_context(cur)
 
         target = self._coerce_5int(action, action_obj=None, player=cur)
         if target is None:
@@ -1568,310 +1644,81 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
 
         forced_player_name_now = getattr(self._get_forced_player(), "name", None) if forced_before else None
         state_fingerprint_now = self._get_state_fingerprint(cur)
-        if state_fingerprint_now is None:
-            cache_ok = False
-        else:
-            cache_ok = False
-            try:
-                cache_ok = (
-                    getattr(self, "_la_cache_turn", None) == now_turn
-                    and getattr(self, "_la_cache_player_name", None) == getattr(cur, "name", None)
-                    and isinstance(getattr(self, "_la_cache_lookup", None), dict)
-                    and getattr(self, "_la_cache_forced_len", None) == forced_len_now
-                    and getattr(self, "_la_cache_forced_player_name", None) == forced_player_name_now
-                    and getattr(self, "_la_cache_state_fingerprint", None) == state_fingerprint_now
-                )
-            except Exception:
-                cache_ok = False
+        cache_ok = None
 
-        if not cache_ok:
-            self._refresh_action_cache(cur)
+        if self._last_action_ids is None or self._last_actions is None or self._last_action_lookup is None:
+            self.legal_actions()
 
-        lookup = None
-        actions = None
-        ids = None
+        actions = self._last_actions
+        ids = self._last_action_ids
+        lookup = self._last_action_lookup
+
+        if not isinstance(actions, list) or not isinstance(ids, list) or not isinstance(lookup, dict):
+            raise RuntimeError("MatchPlayerSimEnv.step invariant failed: legal_actions snapshot is missing.")
+
+        if len(actions) != len(ids):
+            raise RuntimeError("MatchPlayerSimEnv.step invariant failed: len mismatch.")
+
+        if target not in ids:
+            raise RuntimeError("MatchPlayerSimEnv.step invariant failed: action_vec not in legal_action_ids.")
+
         try:
-            lookup = getattr(self, "_la_cache_lookup", None)
-            actions = getattr(self, "_la_cache_actions", None)
-            ids = getattr(self, "_la_cache_ids", None)
-        except Exception:
-            lookup = None
-            actions = None
-            ids = None
+            chosen = lookup[tuple(target)]
+        except KeyError:
+            raise RuntimeError("MatchPlayerSimEnv.step invariant failed: lookup missing target.")
 
-        chosen = None
-        try:
-            if isinstance(lookup, dict):
-                chosen = lookup.get(tuple(target), None)
-        except Exception:
-            chosen = None
-
-        if chosen is None:
-            # 1回だけ再構築して再試行（forced 切替や gather_actions の揺れを吸収）
-            self._refresh_action_cache(cur)
-
+        if self._trace_enabled():
             try:
-                lookup = getattr(self, "_la_cache_lookup", None)
-                actions = getattr(self, "_la_cache_actions", None)
-                ids = getattr(self, "_la_cache_ids", None)
-            except Exception:
-                lookup = None
-                actions = None
-                ids = None
-
-            try:
-                if isinstance(lookup, dict):
-                    chosen = lookup.get(tuple(target), None)
-            except Exception:
-                chosen = None
-
-        if chosen is None:
-            event_id = self._next_la5_event_id()
-            try:
-                setattr(self, "_last_step_no_match_event_id", event_id)
-            except Exception:
-                pass
-            try:
-                setattr(self._match, "_last_step_no_match_event_id", event_id)
-            except Exception:
-                pass
-            def _safe_repr(x: Any, limit: int = 640) -> str:
+                ids_hash = self._hash_vecs(ids)
+                target_in_ids = False
+                generated_new = 0
                 try:
-                    s = repr(x)
+                    if isinstance(ids, list):
+                        target_in_ids = any(tuple(v) == tuple(target) for v in ids if isinstance(v, list))
                 except Exception:
-                    s = f"<repr failed: {type(x).__name__}>"
-                if len(s) > int(limit):
-                    s = s[: int(limit)] + "..."
-                return s
+                    target_in_ids = False
+                event_id = getattr(self, "_la_cache_event_id", None)
+                if event_id is None:
+                    event_id = self._next_la5_event_id()
+                    generated_new = 1
+                import json
 
-            def _try_serialize(a: Any) -> Any:
-                try:
-                    fn = getattr(a, "serialize", None)
-                    if callable(fn):
-                        try:
-                            return fn(player=cur)
-                        except TypeError:
-                            try:
-                                return fn(cur)
-                            except Exception:
-                                return None
-                        except Exception:
-                            return None
-                except Exception:
-                    return None
-                return None
-
-            def _action_brief(a: Any) -> str:
-                if a is None:
-                    return "None"
-                try:
-                    parts = [f"type={type(a).__name__}"]
-                    try:
-                        nm = getattr(a, "name", None)
-                        if nm is not None:
-                            parts.append(f"name={nm}")
-                    except Exception:
-                        pass
-                    try:
-                        at = getattr(a, "action_type", None)
-                        if at is not None:
-                            parts.append(f"action_type={at}")
-                    except Exception:
-                        pass
-                    try:
-                        ser = _try_serialize(a)
-                        if ser is not None:
-                            parts.append(f"serialize={_safe_repr(ser, limit=240)}")
-                    except Exception:
-                        pass
-                    return " ".join(parts)
-                except Exception:
-                    return _safe_repr(a, limit=240)
-
-            import time
-            import traceback
-            from ..debug_dump import write_debug_dump
-
-            ctx = self._get_log_context(cur)
-
-            def _coerce_vec(x: Any, action_obj: Any = None) -> Optional[List[int]]:
-                try:
-                    return self._coerce_5int(x, action_obj=action_obj, player=cur)
-                except Exception:
-                    return None
-
-            def _diff_positions(a: Optional[List[int]], b: Optional[List[int]]) -> List[int]:
-                if not isinstance(a, list) or not isinstance(b, list) or len(a) != len(b):
-                    return []
-                return [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
-
-            action_rows = []
-            matched_indices = []
-            matched_by_converter = []
-            if isinstance(actions, list):
-                for i, a in enumerate(actions):
-                    ser_raw = _try_serialize(a)
-                    ser_5 = _coerce_vec(ser_raw, action_obj=a) if ser_raw is not None else None
-                    to_id = None
-                    try:
-                        fn = getattr(a, "to_id_vec", None)
-                        if callable(fn):
-                            try:
-                                to_id = fn(player=cur)
-                            except TypeError:
-                                to_id = fn(cur)
-                    except Exception:
-                        to_id = None
-                    to_id_5 = _coerce_vec(to_id, action_obj=a) if to_id is not None else None
-                    conv_id = None
-                    if isinstance(ids, list) and i < len(ids):
-                        conv_id = _coerce_vec(ids[i], action_obj=a)
-                    match_conv = bool(conv_id == target) if conv_id is not None else False
-                    match_ser = bool(ser_5 == target) if ser_5 is not None else False
-                    match_to_id = bool(to_id_5 == target) if to_id_5 is not None else False
-                    if match_ser or match_to_id:
-                        matched_indices.append(i)
-                    if match_conv:
-                        matched_by_converter.append(i)
-                    action_rows.append(
-                        {
-                            "i": i,
-                            "action_type": getattr(a, "action_type", None),
-                            "name": getattr(a, "name", None),
-                            "serialize_raw": ser_raw,
-                            "serialize_5": ser_5,
-                            "to_id_vec": to_id_5,
-                            "converter_id": conv_id,
-                            "match_by_serialize": match_ser,
-                            "match_by_to_id": match_to_id,
-                            "match_by_converter": match_conv,
-                            "diff_vs_selected_conv": _diff_positions(target, conv_id),
-                            "diff_vs_selected_serialize": _diff_positions(target, ser_5),
-                            "diff_vs_selected_to_id": _diff_positions(target, to_id_5),
-                        }
-                    )
-
-            legal_actions_serialized = []
-            try:
-                for row in action_rows:
-                    legal_actions_serialized.append(
-                        {
-                            "i": row.get("i"),
-                            "action_type": row.get("action_type"),
-                            "name": row.get("name"),
-                            "vec": row.get("converter_id"),
-                        }
-                    )
-            except Exception:
-                legal_actions_serialized = []
-
-            dump_payload = {
-                "error_type": "action_id_mismatch",
-                "event_id": event_id,
-                "error_message": (
-                    "MatchPlayerSimEnv.step: could not find the Action object for the given 5-int id "
-                    "(cache+converter-based)."
-                ),
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                "run_context": {
-                    "game_id": ctx.get("game_id"),
-                    "turn": ctx.get("turn"),
-                    "player": ctx.get("player"),
-                    "forced_actions_active": ctx.get("forced_active"),
-                },
-                "action_context": {
-                    "selected_vec": target,
-                    "selected_source": None,
-                    "legal_actions_serialized": legal_actions_serialized,
-                },
-                "mcts_context": {
-                    "n_actions": len(actions) if isinstance(actions, list) else None,
-                },
-                "debug_context": {
-                    "cache_ok": cache_ok,
+                trace_payload = {
+                    "event_id": event_id,
+                    "generated_new": int(generated_new),
+                    "state_fingerprint": state_fingerprint_now,
+                    "target_vec": target,
+                    "ids_full": ids if isinstance(ids, list) else None,
+                    "ids_hash": ids_hash,
+                    "target_in_ids": int(bool(target_in_ids)),
                     "cache_key": {
                         "turn": now_turn,
                         "player": ctx.get("player"),
                         "forced_len": forced_len_now,
                         "forced_player": forced_player_name_now,
+                        "state_fp": state_fingerprint_now,
                     },
-                    "cache_state": {
-                        "turn": getattr(self, "_la_cache_turn", None),
-                        "player": getattr(self, "_la_cache_player_name", None),
-                        "forced_len": getattr(self, "_la_cache_forced_len", None),
-                        "forced_player": getattr(self, "_la_cache_forced_player_name", None),
-                    },
-                    "cache_lookup_keys": list(lookup.keys()) if isinstance(lookup, dict) else None,
-                    "forced_len": ctx.get("forced_len"),
-                    "forced_player": ctx.get("forced_player"),
-                    "ids_len": len(ids) if isinstance(ids, list) else None,
-                    "matched_indices": matched_indices,
-                    "matched_by_converter_indices": matched_by_converter,
-                    "action_schema_table": action_rows,
-                },
-                "traceback": traceback.format_stack(limit=10),
-            }
-
-            dump_path = None
-            try:
-                dump_path = write_debug_dump(dump_payload)
-                print(f"[DEBUG_DUMP] wrote: {dump_path}", flush=True)
-            except Exception:
-                dump_path = None
-
-            try:
+                    "input_type": type(action).__name__,
+                    "input_vec": action,
+                }
                 print(
-                    "[MCTS_ENV][LA5][STEP_NO_MATCH]"
+                    "[MCTS_ENV][LA5][TRACE_C]"
                     f" event_id={event_id}"
-                    f" game_id={ctx.get('game_id')}"
-                    f" turn={ctx.get('turn')}"
-                    f" player={ctx.get('player')}"
-                    f" forced_active={ctx.get('forced_active')}"
-                    f" forced_before={forced_before}"
-                    f" target={_safe_repr(target, limit=120)}"
-                    f" cache_ok={cache_ok}"
-                    f" actions_len={len(actions) if isinstance(actions, list) else 'NA'}"
-                    f" ids_len={len(ids) if isinstance(ids, list) else 'NA'}"
-                    f" matched_indices={matched_indices}",
-                    flush=True,
-                )
-            except Exception:
-                pass
-
-            try:
-                action_types = [type(a).__name__ for a in actions] if isinstance(actions, list) else None
-            except Exception:
-                action_types = None
-
-            try:
-                print(
-                    "[MCTS_ENV][LA5][STEP_NO_MATCH_DETAIL]"
-                    f" event_id={event_id}"
-                    f" game_id={ctx.get('game_id')}"
-                    f" turn={ctx.get('turn')}"
-                    f" player={ctx.get('player')}"
-                    f" forced_active={ctx.get('forced_active')}"
-                    f" n_actions={len(actions) if isinstance(actions, list) else 'NA'}"
-                    f" target_type={type(action).__name__}"
-                    f" target={_safe_repr(target, limit=240)}"
+                    f" generated_new={generated_new}"
+                    f" state_fingerprint={state_fingerprint_now}"
+                    f" target_vec={self._format_list_head_tail(target, full=True)}"
                     f" ids_full={self._format_list_head_tail(ids, full=True)}"
-                    f" action_types={self._format_list_head_tail(action_types, full=True)}"
-                    f" matched_indices={matched_indices}"
-                    f" matched_by_converter={matched_by_converter}"
-                    f" cache_ok={cache_ok}"
-                    f" cache_key={{turn:{now_turn},player:{ctx.get('player')},forced_len:{forced_len_now},forced_player:{forced_player_name_now}}}"
-                    f" cache_state={{turn:{getattr(self, '_la_cache_turn', None)},player:{getattr(self, '_la_cache_player_name', None)},"
-                    f"forced_len:{getattr(self, '_la_cache_forced_len', None)},forced_player:{getattr(self, '_la_cache_forced_player_name', None)}}}"
-                    f" cache_lookup_keys={self._format_list_head_tail(list(lookup.keys()) if isinstance(lookup, dict) else None, full=True)}",
+                    f" ids_hash={ids_hash}"
+                    f" target_in_ids={int(bool(target_in_ids))}"
+                    f" cache_key={{turn:{now_turn},player:{ctx.get('player')},forced_len:{forced_len_now},"
+                    f"forced_player:{forced_player_name_now},state_fp:{state_fingerprint_now}}}"
+                    f" input_type={type(action).__name__}"
+                    f" input_vec={self._format_list_head_tail(action, full=True)}"
+                    f" trace_json={json.dumps(trace_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)}",
                     flush=True,
                 )
             except Exception:
                 pass
-
-            raise RuntimeError(
-                "MatchPlayerSimEnv.step: could not find the Action object for the given 5-int id (cache+converter-based). "
-                "This indicates policy output is not in legal_actions, or converter output is unstable."
-            )
 
         # 実行（ログ等の副作用は clone() 側で可能な限り無効化している前提）
         cur.act_and_regather_actions(self._match, chosen)
@@ -1886,6 +1733,11 @@ class MatchPlayerSimEnv(MCTSSimEnvProtocol):
             self._la_cache_forced_len = None
             self._la_cache_forced_player_name = None
             self._la_cache_state_fingerprint = None
+            self._la_cache_event_id = None
+            self._last_actions = None
+            self._last_action_ids = None
+            self._last_action_lookup = None
+            self._last_actions_key = None
         except Exception:
             pass
 
