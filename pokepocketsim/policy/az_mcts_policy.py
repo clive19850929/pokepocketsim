@@ -590,8 +590,6 @@ class AlphaZeroMCTSPolicy:
                     },
                     "traceback": traceback.format_exception(type(e), e, e.__traceback__),
                 }
-                import os
-
                 dump_path = write_debug_dump(payload)
                 if dump_path is not None:
                     try:
@@ -751,6 +749,7 @@ class AlphaZeroMCTSPolicy:
             try:
                 state_dict["az_decision_src"] = str(getattr(self, "last_decision_src", "unknown"))
                 state_dict["az_decision_pick"] = str(getattr(self, "last_pick", "unknown"))
+                state_dict["az_mcts_debug"] = getattr(self, "_last_mcts_detail", None)
             except Exception:
                 pass
 
@@ -1347,6 +1346,22 @@ class AlphaZeroMCTSPolicy:
             if not (s > 0.0):
                 raise RuntimeError("[AZ][MCTS] pi normalization failed (no fallback).")
             pi = [float(x) / s for x in ww]
+
+        try:
+            q_values: List[float] = []
+            prior_values: List[float] = []
+            for k in root_keys:
+                child = root.children.get(k)
+                q_values.append(float(getattr(child, "Q", 0.0)) if child is not None else 0.0)
+                prior_values.append(float(getattr(child, "P", 0.0)) if child is not None else 0.0)
+            self._last_mcts_detail = {
+                "sims": int(sims),
+                "visits": [float(x) for x in visit_counts],
+                "q": q_values,
+                "prior": prior_values,
+            }
+        except Exception:
+            pass
 
         try:
             if os.getenv("AZ_MCTS_DEBUG", "0") == "1":

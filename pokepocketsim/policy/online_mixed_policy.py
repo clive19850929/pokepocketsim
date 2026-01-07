@@ -1,4 +1,7 @@
 from __future__ import annotations
+import hashlib
+import json
+import os
 from typing import Any, List, Optional
 
 
@@ -1873,6 +1876,41 @@ class OnlineMixedPolicy:
 
         # ★追加: 手ごとの決定ソース/idx を state_dict と last_decide_info に確実に残す（printはここではしない）
         def _set_online_mix_trace(_source, _idx, _why=None):
+            def _coerce_vec5(vec):
+                if isinstance(vec, tuple):
+                    vec = list(vec)
+                if not isinstance(vec, list):
+                    return [0, 0, 0, 0, 0]
+                out = list(vec)
+                if len(out) < 5:
+                    out = out + [0] * (5 - len(out))
+                if len(out) > 5:
+                    out = out[:5]
+                return out
+
+            def _action_vec(action):
+                vec = None
+                try:
+                    fn = getattr(action, "to_id_vec", None)
+                    if callable(fn):
+                        try:
+                            vec = fn(player=player)
+                        except TypeError:
+                            vec = fn(player)
+                except Exception:
+                    vec = None
+                if vec is None:
+                    try:
+                        fn = getattr(action, "serialize", None)
+                        if callable(fn):
+                            try:
+                                vec = fn(player=player)
+                            except TypeError:
+                                vec = fn(player)
+                    except Exception:
+                        vec = None
+                return _coerce_vec5(vec)
+
             try:
                 self.last_source = str(_source)
             except Exception:
@@ -1977,6 +2015,8 @@ class OnlineMixedPolicy:
                 state_dict["online_mix_p"] = float(self.mix_prob)
                 if _why is not None:
                     state_dict["online_mix_why"] = str(_why)
+                state_dict["decision_selected_idx"] = int(_idx)
+                state_dict["decision_selected_source"] = str(_source)
             except Exception:
                 pass
 
@@ -2041,6 +2081,214 @@ class OnlineMixedPolicy:
                 except Exception:
                     pass
 
+            try:
+                event_id = state_dict.get("la5_event_id", None)
+                if event_id is None:
+                    event_id = self._next_la5_event_id()
+                    state_dict["la5_event_id"] = event_id
+            except Exception:
+                event_id = None
+
+            try:
+                la_5 = state_dict.get("legal_actions_5", None)
+            except Exception:
+                la_5 = None
+
+            selected_vec = None
+            selected_in_legal_actions = None
+            try:
+                if isinstance(la_5, list) and 0 <= int(_idx) < len(la_5):
+                    selected_vec = la_5[int(_idx)]
+                    selected_in_legal_actions = True
+                else:
+                    selected_vec = _action_vec(actions[int(_idx)])
+                    selected_in_legal_actions = (
+                        isinstance(la_5, list) and selected_vec in la_5
+                    )
+            except Exception:
+                selected_vec = None
+                selected_in_legal_actions = None
+
+            try:
+                state_dict["decision_selected_vec"] = selected_vec
+                state_dict["decision_selected_in_legal_actions"] = selected_in_legal_actions
+            except Exception:
+                pass
+
+            try:
+                mcts_idx = state_dict.get("mcts_idx", None)
+            except Exception:
+                mcts_idx = None
+            final_idx = int(_idx)
+            changed = None
+            try:
+                if mcts_idx is not None:
+                    changed = int(int(mcts_idx) != int(final_idx))
+            except Exception:
+                changed = None
+
+            try:
+                state_dict["mix_idx"] = final_idx
+                state_dict["final_idx"] = final_idx
+                if mcts_idx is not None:
+                    state_dict["mix_changed"] = changed
+            except Exception:
+                pass
+
+            try:
+                if selected_in_legal_actions is False or (changed == 1):
+                    from ..debug_dump import write_debug_dump
+
+                    def _digest_vec(vec):
+                        if isinstance(vec, tuple):
+                            vec = list(vec)
+                        if not isinstance(vec, list):
+                            return "NA"
+                        try:
+                            raw = json.dumps(vec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                        except Exception:
+                            raw = str(vec)
+                        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+
+                    legal_actions_serialized = []
+                    try:
+                        for i, a in enumerate(actions or []):
+                            legal_actions_serialized.append(
+                                {
+                                    "i": i,
+                                    "action_type": getattr(a, "action_type", None),
+                                    "name": getattr(a, "name", None),
+                                    "vec": _action_vec(a),
+                                }
+                            )
+                    except Exception:
+                        legal_actions_serialized = []
+
+                    cand_vecs = None
+                    try:
+                        cand_vecs = (
+                            state_dict.get("cand_vecs", None)
+                            or state_dict.get("action_candidates_vec", None)
+                            or state_dict.get("action_candidates_vecs", None)
+                        )
+                    except Exception:
+                        cand_vecs = None
+
+                    cand_map = []
+                    if isinstance(cand_vecs, list):
+                        try:
+                            for i, row in enumerate(cand_vecs):
+                                cand_map.append({"i": i, "cand_vec_digest": _digest_vec(row)})
+                        except Exception:
+                            cand_map = []
+
+                    pi = None
+                    try:
+                        pi = state_dict.get("pi", None) or state_dict.get("mcts_pi", None) or state_dict.get("policy_pi", None)
+                    except Exception:
+                        pi = None
+
+                    def _topk(arr, k=5):
+                        if not isinstance(arr, list):
+                            return None
+                        try:
+                            order = sorted(range(len(arr)), key=lambda i: float(arr[i]), reverse=True)[:k]
+                            return [{"i": int(i), "p": float(arr[i])} for i in order]
+                        except Exception:
+                            return None
+
+                    mcts_debug = None
+                    try:
+                        mcts_debug = state_dict.get("az_mcts_debug", None)
+                    except Exception:
+                        mcts_debug = None
+
+                    mcts_ctx = None
+                    if isinstance(mcts_debug, dict):
+                        visits = mcts_debug.get("visits")
+                        q_vals = mcts_debug.get("q")
+                        priors = mcts_debug.get("prior")
+                        mcts_ctx = {
+                            "mcts_enabled": True,
+                            "sims": mcts_debug.get("sims"),
+                            "visits_topK": _topk(visits),
+                            "q_topK": _topk(q_vals),
+                            "prior_topK": _topk(priors),
+                        }
+
+                    mix_ctx = {
+                        "lam": state_dict.get("mix_lam", None) if isinstance(state_dict, dict) else None,
+                        "tau": state_dict.get("mix_tau", None) if isinstance(state_dict, dict) else None,
+                        "mcts_idx": mcts_idx,
+                        "mix_idx": final_idx,
+                        "final_idx": final_idx,
+                        "changed": changed,
+                    }
+
+                    try:
+                        m = getattr(player, "match", None) if player is not None else None
+                        game_id = getattr(m, "game_id", None) if m is not None else None
+                        turn = getattr(m, "turn", None) if m is not None else None
+                        fa = getattr(m, "forced_actions", None) if m is not None else None
+                        forced_len = int(len(fa)) if isinstance(fa, (list, tuple)) else None
+                        forced_active = (forced_len > 0) if forced_len is not None else None
+                        player_name = getattr(player, "name", None) if player is not None else None
+                    except Exception:
+                        game_id = None
+                        turn = None
+                        forced_active = None
+                        forced_len = None
+                        player_name = None
+
+                    state_fp = None
+                    try:
+                        state_fp = state_dict.get("trace_state_fingerprint", None) or state_dict.get("env_state_fingerprint", None)
+                    except Exception:
+                        state_fp = None
+
+                    detail_payload = {
+                        "event_id": event_id,
+                        "game_id": game_id,
+                        "turn": turn,
+                        "player": player_name,
+                        "forced_active": forced_active,
+                        "forced_len": forced_len,
+                        "n_actions": int(len(actions)) if isinstance(actions, list) else None,
+                        "state_fingerprint": state_fp,
+                        "selected_idx": int(final_idx),
+                        "selected_action_vec": selected_vec,
+                        "selected_source": str(_source),
+                        "selected_in_legal_actions": selected_in_legal_actions,
+                        "legal_actions_serialized": legal_actions_serialized,
+                        "candidate_vecs": cand_map,
+                        "pi_topK": _topk(pi),
+                        "mcts_context": mcts_ctx,
+                        "mix_context": mix_ctx,
+                        "trigger": "selected_in_legal_actions=false" if selected_in_legal_actions is False else "mcts_idx_changed",
+                    }
+
+                    print(
+                        "[DECISION_DETAIL]"
+                        f" event_id={event_id}"
+                        f" trigger={detail_payload.get('trigger')}"
+                        f" selected_idx={int(final_idx)}"
+                        f" selected_source={_source}"
+                        f" selected_in_legal_actions={selected_in_legal_actions}",
+                        flush=True,
+                    )
+
+                    dump_path = write_debug_dump(detail_payload)
+                    if dump_path is not None:
+                        try:
+                            cwd = os.getcwd()
+                            rel = os.path.relpath(dump_path, cwd)
+                        except Exception:
+                            cwd = None
+                            rel = dump_path
+                        print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}", flush=True)
+            except Exception:
+                pass
+
             if str(_source) == "random" and _why is not None:
                 try:
                     game_id = None
@@ -2068,7 +2316,11 @@ class OnlineMixedPolicy:
                     event_id = None
                     try:
                         if isinstance(state_dict, dict):
-                            event_id = state_dict.get("last_step_no_match_event_id", None)
+                            event_id = (
+                                state_dict.get("la5_event_id", None)
+                                or state_dict.get("decision_event_id", None)
+                                or state_dict.get("last_step_no_match_event_id", None)
+                            )
                     except Exception:
                         event_id = None
                     if event_id is None:

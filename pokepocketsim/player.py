@@ -1,5 +1,8 @@
 from __future__ import annotations
-import random, copy
+import copy
+import hashlib
+import os
+import random
 from typing import (
     List,
     Optional,
@@ -794,6 +797,224 @@ class Player:
                 for line in pend:
                     self.log_print(line)
                 pend.clear()
+        except Exception:
+            pass
+
+        try:
+            summary = getattr(self, "_last_decision_summary", None)
+            detail_state = getattr(self, "_last_decision_detail_state", None)
+            if isinstance(summary, dict):
+                def _coerce_vec5(vec):
+                    if isinstance(vec, tuple):
+                        vec = list(vec)
+                    if not isinstance(vec, list):
+                        return None
+                    out = list(vec)
+                    if len(out) < 5:
+                        out = out + [0] * (5 - len(out))
+                    if len(out) > 5:
+                        out = out[:5]
+                    return out
+
+                def _action_vec(action_obj):
+                    vec = None
+                    try:
+                        fn = getattr(action_obj, "to_id_vec", None)
+                        if callable(fn):
+                            try:
+                                vec = fn(player=self)
+                            except TypeError:
+                                vec = fn(self)
+                    except Exception:
+                        vec = None
+                    if vec is None:
+                        try:
+                            fn = getattr(action_obj, "serialize", None)
+                            if callable(fn):
+                                try:
+                                    vec = fn(player=self)
+                                except TypeError:
+                                    vec = fn(self)
+                        except Exception:
+                            vec = None
+                    return _coerce_vec5(vec)
+
+                applied_vec = _action_vec(action)
+                selected_vec = summary.get("selected_action_vec", None)
+                applied_matches_selected = None
+                if selected_vec is not None and applied_vec is not None:
+                    try:
+                        applied_matches_selected = bool(_coerce_vec5(selected_vec) == _coerce_vec5(applied_vec))
+                    except Exception:
+                        applied_matches_selected = None
+
+                summary["applied_matches_selected"] = applied_matches_selected
+                if isinstance(detail_state, dict):
+                    try:
+                        state_dict = detail_state.get("state_dict", None)
+                        if isinstance(state_dict, dict):
+                            state_dict["decision_applied_matches_selected"] = applied_matches_selected
+                    except Exception:
+                        pass
+
+                self.log_print(
+                    "[DECISION_SUMMARY]"
+                    f" event_id={summary.get('event_id')}"
+                    f" game_id={summary.get('game_id')}"
+                    f" turn={summary.get('turn')}"
+                    f" player={summary.get('player')}"
+                    f" pid={summary.get('pid')}"
+                    f" forced_active={summary.get('forced_active')}"
+                    f" forced_len={summary.get('forced_len')}"
+                    f" n_actions={summary.get('n_actions')}"
+                    f" state_fingerprint={summary.get('state_fingerprint')}"
+                    f" selected_idx={summary.get('selected_idx')}"
+                    f" selected_action_vec={summary.get('selected_action_vec')}"
+                    f" selected_source={summary.get('selected_source')}"
+                    f" selected_in_legal_actions={summary.get('selected_in_legal_actions')}"
+                    f" applied_matches_selected={applied_matches_selected}",
+                )
+
+                if applied_matches_selected is False:
+                    try:
+                        from .debug_dump import write_debug_dump
+
+                        state_dict = detail_state.get("state_dict", None) if isinstance(detail_state, dict) else None
+                        action_list = detail_state.get("actions", None) if isinstance(detail_state, dict) else None
+
+                        def _digest_vec(vec):
+                            if isinstance(vec, tuple):
+                                vec = list(vec)
+                            if not isinstance(vec, list):
+                                return "NA"
+                            try:
+                                raw = json.dumps(vec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                            except Exception:
+                                raw = str(vec)
+                            return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+
+                        legal_actions_serialized = []
+                        try:
+                            for i, a in enumerate(action_list or []):
+                                legal_actions_serialized.append(
+                                    {
+                                        "i": i,
+                                        "action_type": getattr(a, "action_type", None),
+                                        "name": getattr(a, "name", None),
+                                        "vec": _action_vec(a),
+                                    }
+                                )
+                        except Exception:
+                            legal_actions_serialized = []
+
+                        cand_vecs = None
+                        try:
+                            if isinstance(state_dict, dict):
+                                cand_vecs = (
+                                    state_dict.get("cand_vecs", None)
+                                    or state_dict.get("action_candidates_vec", None)
+                                    or state_dict.get("action_candidates_vecs", None)
+                                )
+                        except Exception:
+                            cand_vecs = None
+
+                        cand_map = []
+                        if isinstance(cand_vecs, list):
+                            try:
+                                for i, row in enumerate(cand_vecs):
+                                    cand_map.append({"i": i, "cand_vec_digest": _digest_vec(row)})
+                            except Exception:
+                                cand_map = []
+
+                        pi = None
+                        try:
+                            if isinstance(state_dict, dict):
+                                pi = state_dict.get("pi", None) or state_dict.get("mcts_pi", None) or state_dict.get("policy_pi", None)
+                        except Exception:
+                            pi = None
+
+                        def _topk(arr, k=5):
+                            if not isinstance(arr, list):
+                                return None
+                            try:
+                                order = sorted(range(len(arr)), key=lambda i: float(arr[i]), reverse=True)[:k]
+                                return [{"i": int(i), "p": float(arr[i])} for i in order]
+                            except Exception:
+                                return None
+
+                        mcts_debug = None
+                        try:
+                            if isinstance(state_dict, dict):
+                                mcts_debug = state_dict.get("az_mcts_debug", None)
+                        except Exception:
+                            mcts_debug = None
+
+                        mcts_ctx = None
+                        if isinstance(mcts_debug, dict):
+                            visits = mcts_debug.get("visits")
+                            q_vals = mcts_debug.get("q")
+                            priors = mcts_debug.get("prior")
+                            mcts_ctx = {
+                                "mcts_enabled": True,
+                                "sims": mcts_debug.get("sims"),
+                                "visits_topK": _topk(visits),
+                                "q_topK": _topk(q_vals),
+                                "prior_topK": _topk(priors),
+                            }
+
+                        mix_ctx = None
+                        if isinstance(state_dict, dict):
+                            mix_ctx = {
+                                "lam": state_dict.get("mix_lam", None),
+                                "tau": state_dict.get("mix_tau", None),
+                                "mcts_idx": state_dict.get("mcts_idx", None),
+                                "mix_idx": state_dict.get("mix_idx", None),
+                                "final_idx": summary.get("selected_idx"),
+                                "changed": state_dict.get("mix_changed", None),
+                            }
+
+                        detail_payload = {
+                            "event_id": summary.get("event_id"),
+                            "game_id": summary.get("game_id"),
+                            "turn": summary.get("turn"),
+                            "player": summary.get("player"),
+                            "forced_active": summary.get("forced_active"),
+                            "forced_len": summary.get("forced_len"),
+                            "n_actions": summary.get("n_actions"),
+                            "state_fingerprint": summary.get("state_fingerprint"),
+                            "selected_idx": summary.get("selected_idx"),
+                            "selected_action_vec": summary.get("selected_action_vec"),
+                            "selected_source": summary.get("selected_source"),
+                            "selected_in_legal_actions": summary.get("selected_in_legal_actions"),
+                            "applied_matches_selected": applied_matches_selected,
+                            "legal_actions_serialized": legal_actions_serialized,
+                            "candidate_vecs": cand_map,
+                            "pi_topK": _topk(pi),
+                            "mcts_context": mcts_ctx,
+                            "mix_context": mix_ctx,
+                            "trigger": "applied_matches_selected=false",
+                        }
+
+                        self.log_print(
+                            "[DECISION_DETAIL]"
+                            f" event_id={summary.get('event_id')}"
+                            f" trigger=applied_matches_selected=false"
+                            f" selected_idx={summary.get('selected_idx')}"
+                            f" selected_source={summary.get('selected_source')}"
+                            f" applied_matches_selected={applied_matches_selected}",
+                        )
+
+                        dump_path = write_debug_dump(detail_payload)
+                        if dump_path is not None:
+                            try:
+                                cwd = os.getcwd()
+                                rel = os.path.relpath(dump_path, cwd)
+                            except Exception:
+                                cwd = None
+                                rel = dump_path
+                            self.log_print(f"[DEBUG_DUMP] wrote: {rel} cwd={cwd}")
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -2821,6 +3042,150 @@ class Player:
                     except Exception:
                         pass
 
+                    def _record_decision_summary(idx_value, state_data, action_list):
+                        def _coerce_vec5(vec):
+                            if isinstance(vec, tuple):
+                                vec = list(vec)
+                            if not isinstance(vec, list):
+                                return [0, 0, 0, 0, 0]
+                            out = list(vec)
+                            if len(out) < 5:
+                                out = out + [0] * (5 - len(out))
+                            if len(out) > 5:
+                                out = out[:5]
+                            return out
+
+                        def _action_vec(action_obj):
+                            vec = None
+                            try:
+                                fn = getattr(action_obj, "to_id_vec", None)
+                                if callable(fn):
+                                    try:
+                                        vec = fn(player=self)
+                                    except TypeError:
+                                        vec = fn(self)
+                            except Exception:
+                                vec = None
+                            if vec is None:
+                                try:
+                                    fn = getattr(action_obj, "serialize", None)
+                                    if callable(fn):
+                                        try:
+                                            vec = fn(player=self)
+                                        except TypeError:
+                                            vec = fn(self)
+                                except Exception:
+                                    vec = None
+                            return _coerce_vec5(vec)
+
+                        event_id = None
+                        if isinstance(state_data, dict):
+                            try:
+                                event_id = state_data.get("la5_event_id", None) or state_data.get("decision_event_id", None)
+                            except Exception:
+                                event_id = None
+                        if event_id is None:
+                            try:
+                                m = getattr(self, "match", None)
+                                gid = getattr(m, "game_id", None) if m is not None else None
+                                turn = getattr(m, "turn", None) if m is not None else None
+                                seq = int(getattr(self, "_decision_seq", 0) or 0) + 1
+                                self._decision_seq = seq
+                                event_id = f"{gid}:{getattr(self, 'name', None)}:{turn}:{seq}"
+                            except Exception:
+                                event_id = None
+
+                        if isinstance(state_data, dict):
+                            try:
+                                state_data["decision_event_id"] = event_id
+                            except Exception:
+                                pass
+
+                        forced_active = None
+                        forced_len = None
+                        game_id = None
+                        turn = None
+                        pid = None
+                        try:
+                            m = getattr(self, "match", None)
+                            game_id = getattr(m, "game_id", None) if m is not None else None
+                            turn = getattr(m, "turn", None) if m is not None else None
+                            fa = getattr(m, "forced_actions", None) if m is not None else None
+                            if isinstance(fa, (list, tuple)):
+                                forced_len = int(len(fa))
+                                forced_active = forced_len > 0
+                        except Exception:
+                            forced_active = None
+                            forced_len = None
+                        try:
+                            pid = getattr(self, "pid", None)
+                        except Exception:
+                            pid = None
+
+                        selected_vec = None
+                        selected_in_legal_actions = None
+                        la_5 = None
+                        if isinstance(state_data, dict):
+                            try:
+                                la_5 = state_data.get("legal_actions_5", None)
+                            except Exception:
+                                la_5 = None
+                        try:
+                            if isinstance(la_5, list) and 0 <= int(idx_value) < len(la_5):
+                                selected_vec = la_5[int(idx_value)]
+                                selected_in_legal_actions = True
+                            elif action_list and 0 <= int(idx_value) < len(action_list):
+                                selected_vec = _action_vec(action_list[int(idx_value)])
+                                selected_in_legal_actions = (
+                                    isinstance(la_5, list) and selected_vec in la_5
+                                )
+                        except Exception:
+                            selected_vec = None
+                            selected_in_legal_actions = None
+
+                        selected_source = None
+                        if isinstance(state_data, dict):
+                            try:
+                                selected_source = state_data.get("online_mix_source", None) or state_data.get("az_decision_src", None)
+                            except Exception:
+                                selected_source = None
+                        if selected_source is None:
+                            try:
+                                selected_source = getattr(self.policy, "last_decision_src", None) or getattr(self.policy, "last_source", None)
+                            except Exception:
+                                selected_source = None
+
+                        state_fp = None
+                        if isinstance(state_data, dict):
+                            try:
+                                state_fp = state_data.get("trace_state_fingerprint", None) or state_data.get("env_state_fingerprint", None)
+                            except Exception:
+                                state_fp = None
+
+                        try:
+                            self._last_decision_summary = {
+                                "event_id": event_id,
+                                "game_id": game_id,
+                                "turn": turn,
+                                "player": getattr(self, "name", None),
+                                "pid": pid,
+                                "forced_active": forced_active,
+                                "forced_len": forced_len,
+                                "n_actions": int(len(action_list)) if isinstance(action_list, list) else None,
+                                "state_fingerprint": state_fp,
+                                "selected_idx": int(idx_value),
+                                "selected_action_vec": selected_vec,
+                                "selected_source": selected_source,
+                                "selected_in_legal_actions": selected_in_legal_actions,
+                            }
+                            self._last_decision_detail_state = {
+                                "event_id": event_id,
+                                "state_dict": state_data,
+                                "actions": action_list,
+                            }
+                        except Exception:
+                            pass
+
                     idx = self.policy.select_action_index_online(sd2, actions, player=self)
                     if isinstance(idx, int) and 0 <= idx < len(actions):
                         try:
@@ -2846,6 +3211,10 @@ class Player:
                                         pend.append("[DECIDE_DIFF] " + " ".join(parts))
                                 elif isinstance(info, str) and info:
                                     pend.append("[DECIDE_DIFF] " + info)
+                        except Exception:
+                            pass
+                        try:
+                            _record_decision_summary(idx, sd2, actions)
                         except Exception:
                             pass
                         return idx
@@ -2896,6 +3265,10 @@ class Player:
 
                 idx = self.policy.select_action_index(state_dict, actions, player=self)
                 if isinstance(idx, int) and 0 <= idx < len(actions):
+                    try:
+                        _record_decision_summary(idx, state_dict, actions)
+                    except Exception:
+                        pass
                     return idx
             except Exception:
                 # 例外時はランダムにフォールバック
