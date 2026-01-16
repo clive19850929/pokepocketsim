@@ -10,6 +10,11 @@ _TEE_FP = None
 _TEE_STDOUT0 = None
 _TEE_STDERR0 = None
 
+_CONSOLE_TEE_FP = None
+_CONSOLE_TEE_STDOUT0 = None
+_CONSOLE_TEE_STDERR0 = None
+_CONSOLE_TEE_STDERR_CONSOLE = None
+_CONSOLE_TEE_OWNED = False
 
 class _TeeStream:
     def __init__(self, base, fp):
@@ -73,7 +78,6 @@ def _console_tee_active() -> bool:
         pass
     return False
 
-
 def _console_tee_fp_and_path():
     try:
         obj = getattr(sys, "stdout", None)
@@ -93,6 +97,26 @@ def _console_tee_fp_and_path():
     return None, ""
 
 
+def _console_tee_matches_path(target_path: str) -> bool:
+    """
+    現在 stdout が console_tee 済みで、その出力先が target_path と一致するか。
+
+    - sys.stdout の _base チェーンを辿る（_console_tee_fp_and_path を利用）
+    - パスは normcase/normpath/abspath で正規化して比較
+    """
+    try:
+        fp0, fp0_path = _console_tee_fp_and_path()
+        if fp0 is None:
+            return False
+        if not fp0_path:
+            return False
+
+        target = os.path.normcase(os.path.normpath(os.path.abspath(str(target_path))))
+        cur = os.path.normcase(os.path.normpath(os.path.abspath(str(fp0_path))))
+        return cur == target
+    except Exception:
+        return False
+
 def _tee_console_start(log_path: str, enable: bool = True) -> None:
     # 旧系統(_TeeStream)は使わず、新系統(_ConsoleTeeStream)に統一する
     try:
@@ -102,7 +126,7 @@ def _tee_console_start(log_path: str, enable: bool = True) -> None:
 
 def _tee_console_stop() -> None:
     # _setup_console_tee 側の close を呼ぶ（登録済み atexit と同等）
-    global _CONSOLE_TEE_FP, _CONSOLE_TEE_STDOUT0, _CONSOLE_TEE_STDERR0, _CONSOLE_TEE_OWNED
+    global _CONSOLE_TEE_FP, _CONSOLE_TEE_STDOUT0, _CONSOLE_TEE_STDERR0, _CONSOLE_TEE_OWNED, _CONSOLE_TEE_STDERR_CONSOLE
 
     if not bool(_CONSOLE_TEE_OWNED):
         _CONSOLE_TEE_FP = None
@@ -118,6 +142,22 @@ def _tee_console_stop() -> None:
             sys.stderr = _CONSOLE_TEE_STDERR0
     except Exception:
         pass
+
+    # restore OS-level stderr (fd=2) BEFORE closing fp
+    try:
+        if _CONSOLE_TEE_STDERR_CONSOLE is not None:
+            try:
+                os.dup2(_CONSOLE_TEE_STDERR_CONSOLE.fileno(), 2)
+            except Exception:
+                pass
+            try:
+                _CONSOLE_TEE_STDERR_CONSOLE.close()
+            except Exception:
+                pass
+            _CONSOLE_TEE_STDERR_CONSOLE = None
+    except Exception:
+        pass
+
     try:
         if _CONSOLE_TEE_FP is not None:
             _CONSOLE_TEE_FP.flush()
@@ -140,21 +180,123 @@ class _ConsoleTeeStream:
         except Exception:
             self._console_tee_path = ""
 
-    def write(self, s):
+        self._console_tee_hide = []
         try:
-            self._base.write(s)
+            v = os.getenv("CONSOLE_TEE_HIDE_CONSOLE_SUBSTRINGS", "") or ""
+            for x in v.split(","):
+                x = x.strip()
+                if x:
+                    self._console_tee_hide.append(x)
         except Exception:
             pass
+
+        self._console_tee_linebuf = ""
+
+    def _should_drop_console_line(self, line: str, hide) -> bool:
+        try:
+            if os.getenv("AZ_DECISION_LOG_FILE_ONLY", "0") == "1":
+                if "[AZ][DECISION][CALL]" in line:
+                    return True
+        except Exception:
+            pass
+
+        try:
+            if os.getenv("AZ_DECISION_HIDE_CALL_CONSOLE", "0") == "1":
+                if "[AZ][DECISION][CALL]" in line:
+                    return True
+        except Exception:
+            pass
+
+        if hide:
+            for pat in hide:
+                try:
+                    if pat and pat in line:
+                        return True
+                except Exception:
+                    pass
+
+        return False
+
+    def write(self, s):
+        try:
+            if not isinstance(s, str):
+                s = str(s)
+        except Exception:
+            s = ""
+
         try:
             self._fp.write(s)
         except Exception:
             pass
+
+        hide = None
+        try:
+            hide = getattr(self, "_console_tee_hide", None)
+        except Exception:
+            hide = None
+
+        try:
+            buf = getattr(self, "_console_tee_linebuf", "")
+            if not isinstance(buf, str):
+                buf = str(buf)
+            buf = buf + s
+
+            while True:
+                idx = buf.find("\n")
+                if idx < 0:
+                    break
+
+                line = buf[: idx + 1]
+                buf = buf[idx + 1 :]
+
+                drop = False
+                try:
+                    drop = self._should_drop_console_line(line, hide)
+                except Exception:
+                    drop = False
+
+                if not drop:
+                    try:
+                        self._base.write(line)
+                    except Exception:
+                        pass
+
+            self._console_tee_linebuf = buf
+        except Exception:
+            try:
+                self._base.write(s)
+            except Exception:
+                pass
+
         try:
             return len(s)
         except Exception:
             return 0
 
     def flush(self):
+        hide = None
+        try:
+            hide = getattr(self, "_console_tee_hide", None)
+        except Exception:
+            hide = None
+
+        try:
+            buf = getattr(self, "_console_tee_linebuf", "")
+            if buf:
+                drop = False
+                try:
+                    drop = self._should_drop_console_line(buf, hide)
+                except Exception:
+                    drop = False
+                if not drop:
+                    try:
+                        self._base.write(buf)
+                    except Exception:
+                        pass
+                self._console_tee_linebuf = ""
+        except Exception:
+            pass
+
         try:
             self._base.flush()
         except Exception:
@@ -246,13 +388,25 @@ def _setup_console_tee(log_dir, prefix="ai_vs_ai_console", enable=True, fixed_pa
     try:
         _CONSOLE_TEE_STDOUT0 = sys.stdout
         _CONSOLE_TEE_STDERR0 = sys.stderr
+
+        # NOTE: os.write(2, ...) 等で OS レベル fd=2 に直接書かれる場合があるため、
+        #       sys.stderr 差し替えだけでは拾えない。fd=2 もログへ向ける。
+        try:
+            global _CONSOLE_TEE_STDERR_CONSOLE
+            _fd2 = os.dup(2)
+            os.dup2(fp.fileno(), 2)
+            _CONSOLE_TEE_STDERR_CONSOLE = os.fdopen(_fd2, "w", encoding="utf-8", buffering=1)
+        except Exception:
+            _CONSOLE_TEE_STDERR_CONSOLE = None
+
         sys.stdout = _ConsoleTeeStream(_CONSOLE_TEE_STDOUT0, fp)
-        sys.stderr = _ConsoleTeeStream(_CONSOLE_TEE_STDERR0, fp)
+        _stderr0 = _CONSOLE_TEE_STDERR_CONSOLE if _CONSOLE_TEE_STDERR_CONSOLE is not None else _CONSOLE_TEE_STDERR0
+        sys.stderr = _ConsoleTeeStream(_stderr0, fp)
         _CONSOLE_TEE_FP = fp
         _CONSOLE_TEE_OWNED = True
 
         def _close():
-            global _CONSOLE_TEE_FP, _CONSOLE_TEE_STDOUT0, _CONSOLE_TEE_STDERR0, _CONSOLE_TEE_OWNED
+            global _CONSOLE_TEE_FP, _CONSOLE_TEE_STDOUT0, _CONSOLE_TEE_STDERR0, _CONSOLE_TEE_OWNED, _CONSOLE_TEE_STDERR_CONSOLE
 
             if not bool(_CONSOLE_TEE_OWNED):
                 _CONSOLE_TEE_FP = None
@@ -268,6 +422,22 @@ def _setup_console_tee(log_dir, prefix="ai_vs_ai_console", enable=True, fixed_pa
                     sys.stderr = _CONSOLE_TEE_STDERR0
             except Exception:
                 pass
+
+            # restore OS-level stderr (fd=2) BEFORE closing fp
+            try:
+                if _CONSOLE_TEE_STDERR_CONSOLE is not None:
+                    try:
+                        os.dup2(_CONSOLE_TEE_STDERR_CONSOLE.fileno(), 2)
+                    except Exception:
+                        pass
+                    try:
+                        _CONSOLE_TEE_STDERR_CONSOLE.close()
+                    except Exception:
+                        pass
+                    _CONSOLE_TEE_STDERR_CONSOLE = None
+            except Exception:
+                pass
+
             try:
                 if _CONSOLE_TEE_FP is not None:
                     _CONSOLE_TEE_FP.flush()

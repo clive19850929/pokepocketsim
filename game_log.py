@@ -82,6 +82,36 @@ class GameLogContext:
 
         # 既に console_tee が同一パスへ tee 済みなら、ここでは stdout/stderr を差し替えない
         try:
+            _matches = None
+            try:
+                from console_tee import _console_tee_matches_path as _matches
+            except Exception:
+                _matches = None
+
+            if _matches is not None:
+                try:
+                    if _matches(self._path):
+                        self._orig_out = sys.stdout
+                        self._orig_err = sys.stderr
+
+                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"[LOG] ===== game log begin ===== ts={ts} game_id={self._game_id}")
+                        print(f"[LOG] path={os.path.abspath(self._path)}")
+                        print(f"[LOG] pid={os.getpid()} python={sys.version.split()[0]}")
+                        print(f"[LOG] cwd={os.getcwd()}")
+                        try:
+                            print(f"[LOG] argv={sys.argv}")
+                        except Exception:
+                            pass
+                        print(f"[LOG] ===========================")
+                        return self
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 互換: console_tee.py が無い/読めない場合は従来ロジックで判定する
+        try:
             target = os.path.normcase(os.path.normpath(os.path.abspath(str(self._path))))
             obj = getattr(sys, "stdout", None)
             for _ in range(16):
